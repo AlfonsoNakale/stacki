@@ -365,6 +365,19 @@
   color: var(--color-text-primary);
 }
 
+/* What is inside a section, said at its right edge. Orange = something styles
+   this element from another selector; blue = the selector you have picked is
+   one of them. The same two colours as the property labels inside, so the dot
+   summarises them instead of being a third thing to learn. */
+.embed-editor_section-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-prop-orange);
+}
+.embed-editor_section-dot.is-own { background: var(--color-info); }
+
 /* Chevron pinned to the right. */
 .embed-editor_section-chevron {
   flex-shrink: 0;
@@ -572,6 +585,12 @@
 }
 .embed-editor_spacing-label:disabled { cursor: default; }
 
+/* The number still drags (see useSideDrag), but it reads as a button first —
+   clicking it opens the editor — so it keeps the plain pointer. The resize cursor
+   belongs to the band around it (.embed-editor_spacing-tri), which is only a drag
+   handle. `touch-action: none` stays: a drag from here must not pan the panel. */
+.embed-editor_spacing-label { touch-action: none; }
+
 /* Unset ("0") — dim with a faint neutral hover so it still reads as clickable. */
 .embed-editor_spacing-label:hover:not(:disabled) {
   background: var(--color-bg-active);
@@ -631,10 +650,12 @@
 
 /* Spacing tooltip content, rendered inside the shared body-portaled tooltip. Long
    calc()/custom-property values wrap, while direct variables show their full path. */
+/* Hugs its content — "2rem" gets a chip, not a banner. The cap keeps a long
+   value (a calc() or a variable's full path) wrapping inside the panel instead of
+   running off it; the popup itself is already max-content wide. */
 .embed-editor_spacing-tooltip {
   display: block;
-  width: min(248px, 78vw);
-  min-width: 112px;
+  max-width: min(248px, 78vw);
 }
 .embed-editor_spacing-tooltip-value {
   color: var(--color-text-primary);
@@ -849,9 +870,11 @@
 }
 
 /* Every input in the style panel sits on the darkest inset (matching the
-   Overflow / Display bars), regardless of the surface-context default. */
+   Overflow / Display bars), regardless of the surface-context default. Set as the
+   field's colour variable, so focus keeps it rather than falling back to the
+   context's own inset (a step lighter, and visibly so on the way in). */
 .embed-editor_rule .u-input {
-  background: var(--color-bg-inset);
+  --u-input-bg: var(--color-bg-inset);
 }
 
 /* ── Backgrounds section ── */
@@ -922,6 +945,7 @@
 .embed-editor_bg-layer.is-open > .embed-editor_bg-layer-row { background: var(--color-bg-active); }
 
 .embed-editor_bg-layer-row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -929,6 +953,20 @@
   transition: background var(--transition-fast);
 }
 .embed-editor_bg-layer-row:hover { background: var(--color-bg-hover); }
+/* The whole row opens the layer, not just the label: the button's hit area is
+   stretched over the row (padding and gaps included) rather than nesting the icons
+   inside it, which would make them part of the same button. They sit above it, so a
+   click on the grip or the trash is still their own. */
+.embed-editor_bg-layer-main::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+}
+.embed-editor_bg-grip,
+.embed-editor_bg-layer-action {
+  position: relative;
+  z-index: 1;
+}
 .embed-editor_bg-grip {
   flex: none;
   display: inline-flex;
@@ -936,6 +974,10 @@
   cursor: grab;
 }
 .embed-editor_bg-grip:active { cursor: grabbing; }
+/* The ROW owns the hover feedback. Without this the app-wide `button:hover`
+   (src/styles.css) also washes the label area, so hovering drew a second, lighter
+   box inside the row — which read as a separate control. */
+.embed-editor_bg-layer-main:hover:not(:disabled) { background: none; }
 .embed-editor_bg-layer-main {
   flex: 1;
   min-width: 0;
@@ -957,6 +999,19 @@
   border: var(--border-width-thin) solid var(--color-border-default);
   background-color: #fff;
 }
+/* An image layer's swatch holds an <img> rather than a CSS background, so it
+   can fall through to another url scheme when the first does not load. */
+.embed-editor_bg-layer-preview.is-image {
+  background-color: transparent;
+  overflow: hidden;
+  display: inline-flex;
+}
+.embed-editor_bg-layer-preview.is-image img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
 .embed-editor_bg-layer-label {
   min-width: 0;
   overflow: hidden;
@@ -975,10 +1030,20 @@
   cursor: pointer;
   transition: background var(--transition-fast), color var(--transition-fast);
 }
-.embed-editor_bg-layer-action:hover:not(:disabled) {
-  color: var(--color-danger);
-  background: var(--color-bg-active);
-}
+/* Red is for the one that destroys something. Turning a layer off is
+   reversible — the CSS is commented out, not deleted — so the eye gets the
+   ordinary hover. */
+.embed-editor_bg-layer-action:hover:not(:disabled) { background: var(--color-bg-active); }
+.embed-editor_bg-layer-trash:hover:not(:disabled) { color: var(--color-danger); }
+.embed-editor_bg-layer-eye:hover:not(:disabled) { color: var(--color-text-primary); }
+
+/* A layer that is off. Dimmed rather than hidden — it is still in the stack,
+   still draggable, still yours to bring back, and a row that vanished would be
+   indistinguishable from one that was deleted. Its eye stays lit even when the
+   row is not hovered: it is the only thing saying why this row looks different,
+   and the only way back. */
+.embed-editor_bg-layer.is-hidden .embed-editor_bg-layer-main { opacity: 0.45; }
+.embed-editor_bg-layer.is-hidden .embed-editor_bg-layer-eye { opacity: 1; }
 
 /* Per-layer editor body (Type / value / size / position / tile / fixed). Lives
    inside the full-width popup: each row runs edge to edge with its own padding
@@ -1065,28 +1130,10 @@
   color: var(--color-text-tertiary);
 }
 /* Number field with a trailing unit. */
-.embed-editor_grad-num {
-  display: flex;
-  align-items: center;
-  flex: 1;
-  min-width: 0;
-  padding-right: var(--space-2);
-  border-radius: var(--radius-sm);
-  background: var(--surface-inset);
-}
-.embed-editor_grad-num-input {
-  flex: 1;
-  min-width: 0;
-  border: none;
-  background: transparent;
-  padding: 4px var(--space-2);
-}
-.embed-editor_grad-num-unit {
-  flex: none;
-  font-size: var(--font-size-2xs);
-  color: var(--color-text-tertiary);
-  text-transform: uppercase; /* DEG / % — match Webflow's uppercase unit */
-}
+/* A number-with-unit field. Everything about how it looks is
+   `.embed-editor_field` (below) — the same field as every other row in the
+   panel; this only says how wide it is where it is used. */
+.embed-editor_grad-num { flex: 1; min-width: 0; }
 /* Radial size presets. */
 .embed-editor_grad-sizes {
   position: relative;
@@ -1166,7 +1213,8 @@
   align-items: center;
   justify-content: space-between;
 }
-.embed-editor_grad-check {
+.embed-editor_grad-check,
+.embed-editor_check {
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -1176,7 +1224,8 @@
 }
 /* Custom checkbox — the native control renders the bright OS accent, so replace it
    with a dark box + checkmark that fits the panel. */
-.embed-editor_grad-check input[type="checkbox"] {
+.embed-editor_grad-check input[type="checkbox"],
+.embed-editor_check input[type="checkbox"] {
   appearance: none;
   -webkit-appearance: none;
   flex: none;
@@ -1192,12 +1241,15 @@
   transition: background var(--transition-fast), border-color var(--transition-fast);
 }
 /* Hover brightens the label text (not the checkbox outline). */
-.embed-editor_grad-check:hover { color: var(--color-text-primary); }
-.embed-editor_grad-check input[type="checkbox"]:checked {
+.embed-editor_grad-check:hover,
+.embed-editor_check:hover { color: var(--color-text-primary); }
+.embed-editor_grad-check input[type="checkbox"]:checked,
+.embed-editor_check input[type="checkbox"]:checked {
   background: var(--color-selection-bg);
   border-color: var(--color-selection-bg);
 }
-.embed-editor_grad-check input[type="checkbox"]::after {
+.embed-editor_grad-check input[type="checkbox"]::after,
+.embed-editor_check input[type="checkbox"]::after {
   content: '';
   width: 4px;
   height: 8px;
@@ -1207,14 +1259,17 @@
   transform: rotate(45deg) scale(0);
   transition: transform var(--transition-fast);
 }
-.embed-editor_grad-check input[type="checkbox"]:checked::after {
+.embed-editor_grad-check input[type="checkbox"]:checked::after,
+.embed-editor_check input[type="checkbox"]:checked::after {
   transform: rotate(45deg) scale(1);
 }
-.embed-editor_grad-check input[type="checkbox"]:focus-visible {
+.embed-editor_grad-check input[type="checkbox"]:focus-visible,
+.embed-editor_check input[type="checkbox"]:focus-visible {
   outline: none;
   box-shadow: var(--shadow-focus);
 }
-.embed-editor_grad-check input[type="checkbox"]:disabled {
+.embed-editor_grad-check input[type="checkbox"]:disabled,
+.embed-editor_check input[type="checkbox"]:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }
@@ -1315,11 +1370,14 @@
 .embed-editor_bg-modal-backdrop {
   position: fixed;
   inset: 0;
+  /* Nothing inside a backdrop may give the document something to scroll: a box
+     hanging past the right edge would push the app's own panels off-screen. */
+  overflow: hidden;
   z-index: calc(var(--z-modal) + 2);
   display: flex;
   align-items: center;
-  /* The visible panel (.app_body, zoom 0.75) is left-aligned in the wider window, so
-     pin the popup to the left rather than centering it in the window. */
+  /* The panel is a column at one side of the window, so the popup is pinned to
+     the panel's edge rather than centred in the window. */
   justify-content: flex-start;
   /* No horizontal padding — the popup is full width, flush with the panel edges. */
   padding: 0;
@@ -1333,14 +1391,14 @@
      Narrower than the Size section (64px): these labels top out at "Position"
      (~41px at 11px), so a tight column keeps the control close to the label. */
   --embed-editor_size-label-w: 42px;
-  /* Re-apply the panel's compact zoom (a body-portaled element escapes .app_body's
-     0.75 zoom, so its controls would render 1/0.75 = 33% too big and overflow). The
-     backdrop spans the full window; width:100% zoomed 0.75 = the visible panel width
-     (which is 0.75 of the window), so the popup is flush with the panel, not wider. */
-  zoom: 0.75;
+  /* No zoom. This carried `zoom: 0.75` to re-apply the compact scale of moden's
+     `.app_body`, which a body-portaled element escapes — but this app has no
+     such wrapper and its panel renders at 1, so the zoom was not matching a
+     scale, it was shrinking the popup to three quarters of everything around
+     it. The width is the panel's, measured and set by the popup itself. */
   width: 100%;
   max-width: none;
-  max-height: calc(100vh / 0.75);
+  max-height: 100vh;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -1351,21 +1409,24 @@
   box-shadow: var(--shadow-lg);
 }
 /* Layer editor popover — anchored below the row it edits (LayerPopover). The outer
-   wrapper stays unzoomed so its fixed coordinates are real screen pixels; the inner box
-   re-applies the panel's 0.75 zoom (a body-portaled element escapes .app_body's zoom) so
+   wrapper holds the fixed coordinates; the inner box fills it, so
    its controls match the panel scale, and widens by 1/0.75 to still span the full panel.
    The size-label column var is redeclared because the portal escapes the panel. */
 .embed-editor_layer-popover { z-index: calc(var(--z-modal) + 2); }
+.embed-editor_layer-popover-box.is-scrolling { overflow-y: auto; }
 .embed-editor_layer-popover-box {
   --embed-editor_size-label-w: 42px;
-  /* The wrapper spans the full window; the visible panel (.app_body) is 0.75 of it via
-     zoom, so this box re-applies that zoom and takes width:100% (= window), which the
-     zoom renders at 0.75 → exactly the visible panel width. (calc(100%/0.75) here would
-     render at full window width and overflow the panel by 1/0.75.) */
-  zoom: 0.75;
+  /* The wrapper is sized to the panel (LayerPopover measures it), and this box
+     fills it. It used to carry `zoom: 0.75` to match moden's compact panel
+     wrapper — which this app doesn't render — so every label, field and control
+     in here came out a quarter smaller than the same control in the panel
+     behind it. */
   width: 100%;
-  max-height: calc(94vh / 0.75);
-  overflow-y: auto;
+  max-height: 94vh;
+  /* Visible by default so a dropdown inside can open past the edge (see
+     LayerPopover); scrolling is switched on only for a box that outgrows the
+     screen, which is the only case it was ever for. */
+  overflow: visible;
   padding: var(--space-4);
   border: var(--border-width-thin) solid var(--color-border-strong);
   border-radius: var(--radius-lg);
@@ -1389,9 +1450,14 @@
   max-height: none;
 }
 
-/* Aspect-ratio custom W:H — two number fields with a colon, captions beneath. */
+/* Aspect-ratio custom W:H — two number fields with a colon, captions beneath.
+   Offset past the fixed label column so the pair sits under the dropdown it
+   belongs to, the same way the Sizing customize panel does. Running the full
+   width of the panel, past the label column, it read as a row of its own rather
+   than as the rest of the Ratio answer. */
 .embed-editor_ratio-custom {
   padding-top: var(--space-2);
+  margin-left: calc(var(--embed-editor_size-label-w) + var(--space-3));
 }
 .embed-editor_ratio-pair {
   display: grid;
@@ -1592,17 +1658,15 @@
 /* Trailing edit glyph (direct child only — not the type glyph nested in the span). */
 .embed-editor_clip-trigger > svg { flex-shrink: 0; width: 14px; height: 14px; color: var(--color-text-tertiary); }
 
-/* The editor modal mirrors the bg-modal: full panel width, re-applying the panel's
-   0.75 zoom (portaled nodes escape .app_body's zoom) so the tool renders at panel
-   scale, exactly as it did standalone. */
+/* The editor modal mirrors the bg-modal: full panel width, at the panel's own
+   scale (see .embed-editor_bg-modal for the zoom this used to re-apply). */
 .embed-editor_clip-modal {
-  zoom: 0.75;
   width: 100%;
   max-width: none;
   /* Cap short of the viewport so the centered sheet leaves clickable backdrop above
      and below — otherwise a tall shape()'s code output grows it to full height and
-     there's nowhere to click out. Divided by the 0.75 zoom to read as ~86vh on screen. */
-  max-height: calc(86vh / 0.75);
+     there's nowhere to click out. */
+  max-height: 86vh;
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -1670,7 +1734,19 @@
   padding: var(--space-4);
 }
 .embed-editor_grid-section { display: flex; flex-direction: column; gap: var(--space-2); }
-.embed-editor_grid-section-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+/* Label, then the controls that say how the value is written, packed together
+   on the left — spread across the row they read as three unrelated things. The
+   add button keeps the right edge, where every section's add is. */
+.embed-editor_grid-section-head { display: flex; align-items: center; gap: var(--space-3); }
+/* `:not(:first-child)` because a head that holds ONLY its title has that title
+   as its last child too — and the auto-generated sections have exactly that, so
+   their heading was pushed out to the right edge on its own while every other
+   heading sat on the left. Push a trailing control out; never the only thing
+   in the row. */
+.embed-editor_grid-section-head > :last-child:not(:first-child) { margin-left: auto; }
+/* …unless the last thing IS a control in the group (the expression toggle,
+   with the add hidden while it is open) — then nothing gets pushed out. */
+.embed-editor_grid-section-head > .embed-editor_icon-btn:last-child[aria-pressed] { margin-left: 0; }
 /* GroupLabel (blue/orange/grey) + a greyed track count. */
 .embed-editor_grid-section-title { display: inline-flex; align-items: center; gap: var(--space-2); font-size: var(--font-size-xs); }
 .embed-editor_grid-section-count { color: var(--color-text-tertiary); }
@@ -1686,6 +1762,11 @@
   background: var(--color-bg-inset);
 }
 .embed-editor_grid-track { position: relative; border-radius: var(--radius-sm); }
+/* The whole row lights up, the way the background-layer list does — the press
+   target is the row, so the row is what should answer the pointer. `:not(.is-open)`
+   rather than source order: both selectors weigh the same, and an open track
+   should keep its stronger fill while the pointer is over it. */
+.embed-editor_grid-track:hover:not(.is-open) { background: var(--color-bg-hover); }
 .embed-editor_grid-track.is-open { background: var(--color-bg-active); }
 /* Drop indicator: a straight, square-ended blue line at the insertion point — not an
    inset box-shadow, which curves to follow the row's border-radius. */
@@ -1836,6 +1917,72 @@
 }
 /* Auto-fit toggle + its constraint warning (reuses the custom .embed-editor_grad-check). */
 .embed-editor_grid-autofit { align-self: flex-start; }
+
+/* The whole track list as one field (the {} toggle): the same editor the panel
+   opens over a cramped value, given room here instead. Monospaced and wrapping,
+   because what is in it is CSS being read as CSS. The token editor lies over
+   this textarea when there are variables to draw as chips, so the two have to
+   agree on size, spacing and line height. */
+.embed-editor_grid-expression,
+.embed-editor_varconnect.is-multiline.is-token > .embed-editor_varconnect-editor {
+  width: 100%;
+  min-height: 76px;
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  border-radius: var(--radius-input);
+  background: var(--color-bg-inset);
+  color: var(--color-text-primary);
+  font-family: var(--font-family-mono, var(--font-family-sans));
+  font-size: var(--font-size-sm);
+  line-height: 1.6;
+  resize: vertical;
+}
+.embed-editor_grid-expression:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 var(--border-width-default) var(--color-border-focus);
+}
+
+/* A labelled on/off, drawn as the same blue pill every other toggle in the panel
+   uses (.embed-editor_icon-btn.is-active, an active field label): quiet at rest,
+   info-blue when on. The iOS-style track and knob it used to draw were the only
+   ones of their kind in the app and read as borrowed from somewhere else. The real
+   checkbox stays in the markup for the keyboard and screen readers. */
+.embed-editor_switch {
+  display: inline-flex;
+  align-items: center;
+  height: var(--size-control-md);
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+  user-select: none;
+  color: var(--color-text-secondary);
+  font-family: var(--font-family-mono, var(--font-family-sans));
+  font-size: var(--font-size-xs);
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.embed-editor_switch input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.embed-editor_switch:hover:not(.is-disabled):not(.is-on) { background: var(--color-bg-hover); }
+.embed-editor_switch.is-on {
+  background: color-mix(in srgb, var(--color-info) 14%, transparent);
+  color: var(--color-info);
+}
+.embed-editor_switch:has(input:focus-visible) {
+  outline: none;
+  box-shadow: 0 0 0 var(--border-width-default) var(--color-border-focus);
+}
+.embed-editor_switch.is-disabled { opacity: 0.45; cursor: not-allowed; }
+.embed-editor_switch.is-on:hover:not(.is-disabled) { color: var(--color-info); }
+.embed-editor_switch input:focus-visible + .embed-editor_switch-track {
+  box-shadow: 0 0 0 var(--border-width-default) var(--color-border-focus);
+}
+.embed-editor_switch-label { letter-spacing: -0.01em; }
 .embed-editor_grid-warning {
   display: flex;
   gap: var(--space-3);
@@ -1944,14 +2091,6 @@
   align-items: center;
   min-height: var(--size-input);
 }
-/* The deselected (orange) label IS the pill (no wrapper like the blue FieldLabel), so
-   the row's min-height stretches its background tall. Let it hug its content and sit
-   centered on the first control row instead. */
-.embed-editor_align-row > .embed-editor_prop-orange {
-  min-height: 0;
-  align-self: start;
-  margin-top: var(--space-4);
-}
 
 /* Preview square: a 3×3 click grid beneath a real-flex bar preview. Stretches to
    the height of the two stacked axis dropdowns beside it. */
@@ -2035,7 +2174,7 @@
 }
 .embed-editor_align-baseline svg { width: 14px; height: 16px; }
 
-/* X / Y axis rows: a small caption + the dropdown. */
+/* X / Y axis rows: the axis's own clearable label + the dropdown. */
 .embed-editor_align-axes {
   flex: 1 1 auto;
   min-width: 0;
@@ -2047,12 +2186,14 @@
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
-  gap: var(--space-2);
+  /* The label is the shared field label (blue pill / orange when set), so it needs
+     room on both sides: an indent keeps its pill off the preview box, and the gap
+     clears it off the dropdown (which gives up the width). */
+  gap: var(--space-3);
   min-width: 0;
 }
-.embed-editor_align-axis-label {
-  font-size: var(--font-size-xs);
-  color: var(--color-text-tertiary);
+.embed-editor_align-axis > .embed-editor_size-label {
+  margin-left: var(--space-2);
 }
 
 /* ── Borders section ── */
@@ -2066,24 +2207,47 @@
   gap: var(--space-3);
 }
 
-/* Radius: link toggle + the linked field (the 2×2 corner grid renders below). */
+/* Radius: the `border-radius` field (the 2×2 corner grid renders below it). */
 .embed-editor_radius-head {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.embed-editor_radius-head > .embed-editor_border-field { flex: 1 1 auto; min-width: 0; }
+/* 2×2 corner fields, indented to sit under the control column (past the label).
+   The column gap is wider than the row gap so the left field doesn't run into the
+   right pair's corner glyph. */
+.embed-editor_radius-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--space-2) var(--space-5);
+  margin-left: calc(var(--embed-editor_size-label-w) + var(--space-3));
+}
+/* One corner: its glyph (a clearable label for that corner) + the length field. */
+.embed-editor_radius-corner {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   min-width: 0;
 }
-.embed-editor_radius-toggle { flex: 0 0 auto; }
-.embed-editor_radius-head > .embed-editor_border-field { flex: 1 1 auto; min-width: 0; }
-/* 2×2 corner fields, indented to sit under the control column (past the label). */
-.embed-editor_radius-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: var(--space-2);
-  margin-left: calc(var(--embed-editor_size-label-w) + var(--space-3));
+/* The glyph sits in the field label's pill, so it picks up the blue / orange states
+   and the reset menu — sized to the icon rather than to a line of text. */
+.embed-editor_radius-corner-label { flex: 0 0 auto; }
+.embed-editor_radius-corner-label .u-field-label,
+.embed-editor_radius-corner-label.u-field-label,
+.embed-editor_radius-corner-label.embed-editor_prop-orange {
+  padding: var(--space-2);
+  line-height: 0;
+}
+/* flex: none — the label is a flex item inside a flex row, so without it the glyph
+   gets squeezed out of square when the field wants the space. */
+.embed-editor_radius-corner-label svg {
+  flex: none;
+  width: 18px;
+  height: 18px;
 }
 
-/* A length field with a leading corner glyph inside the input box. */
+/* A length field (the corner glyph beside it is a label of its own). */
 .embed-editor_border-field {
   position: relative;
   display: flex;
@@ -2092,15 +2256,6 @@
   flex: 1 1 auto;
 }
 .embed-editor_border-field .embed-editor_size-input { width: 100%; }
-.embed-editor_border-field.has-prefix .embed-editor_size-input { padding-left: calc(var(--space-4) + 16px); }
-.embed-editor_border-icon {
-  position: absolute;
-  left: var(--space-3);
-  display: inline-flex;
-  color: var(--color-text-tertiary);
-  pointer-events: none;
-}
-.embed-editor_border-icon svg { width: 16px; height: 16px; }
 
 .embed-editor_border-heading {
   color: var(--color-text-tertiary);
@@ -2161,6 +2316,41 @@
 /* The style segments carry a text glyph (✕) or a line span rather than a centered
    svg, so center their content explicitly (the shared -seg only centers <svg>). */
 .embed-editor_border-style .embed-editor_display-seg { display: flex; align-items: center; justify-content: center; }
+
+/* Pin-to presets: nine ways to place a positioned element, above the inset box.
+   Its own selected state rather than the display bar's — that one is drawn by a
+   sliding pill, and without the pill `is-selected` would only tint the glyph. */
+.embed-editor_inset-presets {
+  display: grid;
+  grid-template-columns: repeat(9, 1fr);
+  gap: var(--space-1);
+  align-items: center;
+  /* Line up with the controls rather than the labels — the same offset the
+     inset box below already uses, so the two read as one stack under the
+     position dropdown instead of three things at three different left edges. */
+  margin-left: calc(var(--embed-editor_size-label-w) + var(--space-3));
+}
+.embed-editor_inset-preset {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--size-control-md);
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.embed-editor_inset-preset svg { display: block; width: 16px; height: 16px; }
+.embed-editor_inset-preset:hover:not(:disabled) { color: var(--color-text-primary); }
+.embed-editor_inset-preset.is-selected {
+  background: var(--color-bg-surface-high);
+  color: var(--color-text-primary);
+}
+.embed-editor_inset-preset:disabled { cursor: not-allowed; opacity: 0.5; }
 
 /* Color: swatch + value field. */
 .embed-editor_border-color {
@@ -2300,7 +2490,28 @@ textarea.embed-editor_value-input.is-expanded {
   background: var(--color-bg-inset);
 }
 
+/* The selected segment, as one thing that moves rather than four that take
+   turns being visible. Mirrors .u-segmented-indicator, which the rest of the
+   panel's segmented controls already use. */
+.embed-editor_display-indicator {
+  position: absolute;
+  z-index: 0;
+  top: var(--space-1);
+  bottom: var(--space-1);
+  left: 0;
+  width: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface-control);
+  pointer-events: none;
+}
+
+.embed-editor_display-indicator.is-animated {
+  transition: transform var(--transition-normal), width var(--transition-normal);
+}
+
 .embed-editor_display-seg {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2327,14 +2538,22 @@ textarea.embed-editor_value-input.is-expanded {
   width: 16px;
   height: 16px;
 }
-.embed-editor_display-seg.is-selected {
-  background: var(--surface-control);
+.embed-editor_display-seg.is-selected { color: var(--color-text-primary); }
+/* Hovering an inactive segment tints its background and lifts the text. */
+/* Hover lifts the label, and nothing else: a background here would be a second
+   thing claiming to be the selection while the pill is on its way. */
+.embed-editor_display-seg:hover:not(:disabled) {
+  background: none;
   color: var(--color-text-primary);
 }
-/* Hovering an inactive segment tints its background and lifts the text. */
-.embed-editor_display-seg:not(.is-selected):hover:not(:disabled) {
-  background: color-mix(in srgb, var(--color-text-primary) 14%, transparent);
-  color: var(--color-text-primary);
+/* The chosen one keeps its own surface under the pointer: it is the answer, not
+   an offer. Stated rather than left alone because the app's blanket
+   `button:hover` (src/styles.css) outweighs a class-only background and was
+   repainting it — the same reason the shared segmented control below needs a
+   hover of its own. */
+
+.embed-editor_border-side.is-active:hover:not(:disabled) {
+  background: var(--surface-control);
 }
 
 /* The dropdown arrow is its own button, sitting next to the 4th value segment. */
@@ -2353,7 +2572,7 @@ textarea.embed-editor_value-input.is-expanded {
   transition: background var(--transition-fast), color var(--transition-fast);
 }
 .embed-editor_display-arrow:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--color-text-primary) 14%, transparent);
+  background: none;
   color: var(--color-text-primary);
 }
 .embed-editor_display-arrow:disabled { cursor: not-allowed; }
@@ -2975,6 +3194,21 @@ textarea.embed-editor_value-input.is-expanded {
   font-size: var(--font-size-2xs);
   color: var(--color-text-tertiary);
 }
+/* What a rename is about to touch — on the same line as the buttons it qualifies,
+   at the panel's ordinary label size. It's the one thing on this form that says
+   how far the change reaches, so it reads as text, not as fine print. */
+.embed-editor_add-query-count {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+/* The add form wraps (its wrap/nest switch needs the room); the rename form is a
+   label and two buttons and stays on one line, the label giving way first. */
+.embed-editor_add-query.is-rename .embed-editor_add-query-controls { flex-wrap: nowrap; }
 
 /* ── Selector picker (chips of every selector that styles the element + add input) ── */
 .embed-editor_selectors {
@@ -2997,7 +3231,13 @@ textarea.embed-editor_value-input.is-expanded {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  min-height: 32px;
+  /* One chip row, whatever is in it: the spinner shown while the scan runs stands
+     exactly as tall as the chips it is standing in for, so the well doesn't change
+     height — and everything under it doesn't jump — when they arrive. */
+  --embed-editor_chip-h: calc(
+    (var(--font-size-xs) * var(--line-height-tight)) + 4px + (2 * var(--border-width-thin))
+  );
+  min-height: calc(var(--embed-editor_chip-h) + (2 * var(--space-3)));
   padding: var(--space-3);
   cursor: text;
 }
@@ -3007,9 +3247,34 @@ textarea.embed-editor_value-input.is-expanded {
   align-items: center;
   gap: var(--space-2);
 }
+
+/* The well before its chips have been counted. An empty black box reads as "this
+   element has no selectors", which is a different answer from "not counted yet" —
+   so the wait says so, in the place the first chip will take, at a chip's height so
+   the box holds its shape when they arrive. */
+.embed-editor_selector-loading {
+  display: flex;
+  align-items: center;
+  min-height: var(--embed-editor_chip-h); /* exactly a chip — see the well above */
+  /* A step brighter than the source picker's spinner: that one sits beside a label
+     that already says what is happening, this one is the only thing in the box. */
+  color: var(--color-text-secondary);
+}
+.embed-editor_selector-loading svg {
+  width: 12px;
+  height: 12px;
+  animation: embed-editor-spin 0.7s linear infinite;
+}
+/* Nothing to reveal (or not counted yet): the row holds its place, quietly. */
+.embed-editor_globals-check.is-empty {
+  opacity: 0.45;
+  cursor: default;
+}
+
 /* Solid-blue, near-square tags with white text (Webflow class-tag styling). */
 .embed-editor_selector-chip {
   max-width: 100%;
+  min-height: var(--embed-editor_chip-h);
   padding: 2px var(--space-2);
   border: var(--border-width-thin) solid transparent;
   border-radius: var(--radius-xs);
@@ -3648,42 +3913,12 @@ textarea.embed-editor_value-input.is-expanded {
   gap: var(--space-4);
   padding: var(--space-4);
 }
-/* The label hugs its text (never shrinks/clips); the grid + offsets take the rest. */
+/* The label hugs its text (never shrinks/clips); the grid + offsets take the rest.
+   Everything in here is the panel's own size — the preset cells, the field labels and
+   the offset inputs were each shrunk a step, which made the popup read as a smaller,
+   separate app rather than the panel it opened from. */
 .embed-editor_imgfit-pos-label { flex: none; }
 .embed-editor_imgfit-pos .embed-editor_bg-position { flex: 1 1 auto; }
-/* Match the "Position" label to the smaller Left/Top captions (the default field label
-   is font-size-md, which reads oversized next to this compact control). */
-.embed-editor_imgfit-pos-label { color: var(--color-text-secondary); }
-.embed-editor_imgfit-pos-label.u-field-label,
-.embed-editor_imgfit-pos-label .u-field-label { font-size: var(--font-size-xs); }
-.embed-editor_imgfit-pos .embed-editor_bg-poscell { width: 16px; height: 16px; }
-/* One bordered field holding the offset input + an inline "%" unit hint — the input
-   carries the raw value, so any unit (10px, unset, var(…)) can be typed. */
-.embed-editor_imgfit-num {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-  height: var(--size-control-md);
-  padding: 0 var(--space-2);
-  border: var(--border-width-thin) solid var(--color-border-default);
-  border-radius: var(--radius-sm);
-  background: var(--surface-control);
-  transition: border-color var(--transition-fast);
-}
-.embed-editor_imgfit-num:focus-within { border-color: var(--color-border-focus); }
-.embed-editor_imgfit-num.is-disabled { opacity: 0.5; }
-.embed-editor_imgfit-input {
-  flex: 1 1 auto;
-  min-width: 0;
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: var(--color-text-primary);
-  font-family: var(--font-family-mono);
-  font-size: var(--font-size-xs);
-  outline: none;
-}
-.embed-editor_imgfit-unit { flex: none; padding-left: var(--space-1); font-size: var(--font-size-2xs); color: var(--color-text-tertiary); }
 
 /* Two captioned fields side by side (Width/Height). */
 .embed-editor_bg-pair {
@@ -3864,15 +4099,14 @@ textarea.embed-editor_value-input.is-expanded {
   gap: var(--space-3);
   padding: var(--space-4);
 }
-/* Compact controls in this editor — the standard input height reads chunky next to
-   the thin sliders, so drop to the medium control size (matching the panel's other
-   compact controls) for the fields and the colour swatch. */
-.embed-editor_type-shadow-editor .u-input,
+/* The fields here are the panel's fields. They used to be dropped to the medium
+   control size on the grounds that a full-height input reads chunky beside a thin
+   slider — but this editor opens over the panel, a row above the same control at
+   its normal size, and the two being different sizes is the thing you notice.
+   Only the swatch keeps a width of its own, so it stays a square of colour. */
 .embed-editor_type-shadow-editor .u-color-swatch {
-  height: var(--size-control-md);
-}
-.embed-editor_type-shadow-editor .u-color-swatch {
-  width: 34px;
+  width: var(--size-input);
+  height: var(--size-input);
 }
 
 /* Shadow X / Y / Blur: a draggable slider bar fills the control cell, with a compact
@@ -3884,12 +4118,18 @@ textarea.embed-editor_value-input.is-expanded {
   min-width: 0;
 }
 .embed-editor_shadow-num {
-  flex: 0 0 auto;
+  /* The number gives way before the slider does: it can lose a few pixels and
+     still be read, where a squeezed slider stops being one. */
+  flex: 0 1 auto;
   width: 3.75rem;
+  min-width: 3rem;
 }
 /* Opacity's number field beside its slider: a fixed-width number+unit box. */
 .embed-editor_opacity-num {
   flex: 0 0 4rem;
+  /* The slider's thumb reaches the very end of its track, so the row's own gap left
+     it all but touching the field. This is the space between the two controls. */
+  margin-left: var(--space-3);
 }
 
 /* Transform axis label: the Webflow glyph (per axis, per Move/Scale/Rotate/Skew) sits
@@ -3916,8 +4156,11 @@ textarea.embed-editor_value-input.is-expanded {
 .embed-editor_transform-lock,
 .embed-editor_transform-lock-spacer {
   flex: 0 0 auto;
-  width: var(--size-control-md);
-  padding-left: 10px;
+  /* Room for the bracket AND the padlock: at the old width the two shared 26px,
+     which left the icon a few pixels wide beside 34px fields — the one control
+     in the row you couldn't see. */
+  width: 36px;
+  padding-left: 12px;
 }
 .embed-editor_transform-lock {
   position: relative;
@@ -3942,7 +4185,12 @@ textarea.embed-editor_value-input.is-expanded {
   border-left: none;
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 }
-.embed-editor_transform-lock svg { width: 14px; height: 14px; }
+/* Drawn at the size it was drawn for (the glyphs are 16px artboards). `flex:
+   none` because the button is a flex row: without it the icon is a shrinkable
+   item and the padding that makes room for the bracket squeezes it narrower
+   than it is tall. */
+.embed-editor_transform-lock svg { flex: none; width: 16px; height: 16px; }
+.embed-editor_transform-lock { color: var(--color-text-secondary); }
 .embed-editor_transform-lock.is-locked { color: var(--color-info); }
 .embed-editor_transform-lock:hover:not(:disabled) { color: var(--color-text-primary); }
 .embed-editor_transform-lock:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -3974,9 +4222,18 @@ textarea.embed-editor_value-input.is-expanded {
   gap: var(--space-4);
   padding: var(--space-4);
 }
+/* Slider then field. The slider is given a width of its own — it is a thing you
+   drag, and a track that shrinks to whatever the value leaves over is a track
+   you cannot aim at (a variable's name in the field left about four pixels of
+   it). The field takes what is left. */
 .embed-editor_trans-duration { display: flex; align-items: center; gap: var(--space-3); min-width: 0; }
-.embed-editor_trans-duration > :first-child { flex: 1 1 auto; min-width: 0; }
-.embed-editor_trans-dur-input { flex: none; width: 72px; text-align: right; font-family: var(--font-family-mono); font-size: var(--font-size-xs); }
+.embed-editor_trans-duration > .u-drag-slider { flex: 0 0 96px; min-width: 96px; }
+.embed-editor_trans-duration > .embed-editor_field { flex: 1 1 auto; min-width: 0; }
+/* The same size as every other field in the panel — these were a step smaller
+   for no reason the popup gives, and a popup is where a value is being read
+   most carefully. */
+/* The value reads right-aligned against the slider beside it. */
+.embed-editor_trans-duration .u-input { text-align: right; }
 .embed-editor_trans-easing {
   flex: 1 1 auto;
   min-width: 0;
@@ -3989,18 +4246,19 @@ textarea.embed-editor_value-input.is-expanded {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: var(--size-control-md);
-  height: var(--size-control-md);
+  /* As tall as the field it sits beside, so the row reads as one control. */
+  width: var(--size-input);
+  height: var(--size-input);
   padding: 0;
   border: var(--border-width-thin) solid var(--color-border-default);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-input);
   background: var(--color-bg-inset);
   color: var(--color-info);
   cursor: pointer;
 }
 .embed-editor_trans-easing-btn:hover:not(:disabled) { border-color: var(--color-border-focus); }
 .embed-editor_trans-easing-btn:disabled { cursor: default; opacity: 0.5; }
-.embed-editor_trans-easing-input { flex: 1 1 auto; min-width: 0; font-family: var(--font-family-mono); font-size: var(--font-size-xs); }
+.embed-editor_trans-easing > .embed-editor_field { flex: 1 1 auto; min-width: 0; }
 
 /* Easing editor dialog. Designer panels are ~300px wide, so this is a full-panel-
    width sheet (a wide centered card would overflow and collapse the curve). Single
@@ -4048,7 +4306,29 @@ textarea.embed-editor_value-input.is-expanded {
 .embed-editor_ease-path { fill: none; stroke: #fff; stroke-width: 2; }
 .embed-editor_ease-handle { fill: var(--color-info); stroke: var(--color-bg-surface); stroke-width: 1.5; cursor: grab; }
 .embed-editor_ease-handle:active { cursor: grabbing; }
-.embed-editor_ease-value { font-family: var(--font-family-mono); font-size: var(--font-size-xs); color: var(--color-text-secondary); }
+/* The value under the curve: a field, not a caption. Full width of the curve
+   above it so a long cubic-bezier() has room. */
+.embed-editor_ease-value { width: 100%; max-width: 280px; }
+.embed-editor_ease-input {
+  width: 100%;
+  text-align: center;
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs);
+}
+/* Opened over one panel rather than the whole window (see the `frame` prop):
+   the backdrop still covers everything, the modal sits over the panel it came
+   from. Fixed, not absolute — its left/width are viewport coordinates, and it
+   should not depend on the backdrop being its containing block. */
+.embed-editor_ease-modal.is-framed {
+  position: fixed;
+  top: 50%;
+  transform: translateY(-50%);
+  /* A dialog, not a sheet: the curve and the first presets, with the rest of
+     them scrolling inside it. */
+  max-height: min(70vh, 560px);
+  border: var(--border-width-thin) solid var(--color-border-default);
+  border-radius: var(--radius-md);
+}
 .embed-editor_ease-presets {
   padding: var(--space-4);
   border-top: var(--border-width-thin) solid var(--color-border-default);
@@ -4081,14 +4361,6 @@ textarea.embed-editor_value-input.is-expanded {
 .embed-editor_eff-modal .embed-editor_filter-editor { overflow: visible; }
 
 /* Transition editor disclaimer (transitions go to custom code). */
-.embed-editor_trans-note {
-  margin: 0;
-  padding: 0 var(--space-1);
-  font-size: var(--font-size-2xs);
-  color: var(--color-text-tertiary);
-  line-height: var(--line-height-normal);
-}
-
 /* ── Connect to variable (per-input dot + picker) ── */
 .embed-editor_varconnect {
   position: relative;
@@ -4101,6 +4373,42 @@ textarea.embed-editor_value-input.is-expanded {
 .embed-editor_varconnect.is-fill { flex: 1 1 0; }
 /* The dot sits in the input's top-left corner, hidden until the input is hovered —
    white with a purple ring. --ee-connect is Webflow's variable-connect purple. */
+/* The rich field stands in for an input, so it wears the same focus ring. Left
+   to itself a contentEditable draws the browser's own — which on macOS is the
+   accent colour from System Settings, so the box came up orange, green or
+   whatever the user happens to have chosen. */
+/* The rich field stands in for an <input>, so it shows that input's placeholder
+   while it holds nothing. `:has(br:only-child)` covers the filler a browser leaves
+   behind after everything is deleted, which is not :empty. */
+.embed-editor_varconnect-editor:empty::before,
+.embed-editor_varconnect-editor:has(br:only-child)::before {
+  content: attr(data-placeholder);
+  color: var(--color-text-tertiary);
+  pointer-events: none;
+}
+
+.embed-editor_varconnect.is-token > .embed-editor_varconnect-editor::-webkit-scrollbar {
+  display: none;
+}
+
+.embed-editor_varconnect-editor:focus {
+  outline: none;
+  box-shadow: 0 0 0 var(--border-width-default) var(--color-border-focus);
+}
+
+/* Syntax colours for a value edited as code (see lib/css-code.ts). Kept close to
+   the token chips' own palette so a value reads as one thing: the purple is the
+   variable's, numbers are the value's own, and everything structural stays quiet.
+   Inherited `color` is the fallback for anything untokenised. */
+.cx-num { color: #d6b6ff; }
+.cx-unit { color: #9d7fd8; }
+.cx-fn { color: #7fd1e8; }
+.cx-ident { color: var(--color-text-primary, #f5f5f5); }
+.cx-string { color: #a8dba8; }
+.cx-hex { color: #a8dba8; }
+.cx-prop { color: #c4afff; }
+.cx-comment { color: var(--color-text-tertiary, #666); font-style: italic; }
+
 .embed-editor_varconnect-dot {
   --ee-connect: #7c5cff;
   position: absolute;
@@ -4168,8 +4476,20 @@ textarea.embed-editor_value-input.is-expanded {
   display: flex;
   align-items: center;
   white-space: nowrap;
-  overflow: hidden;
-  line-height: var(--line-height-normal);
+  /* A value wider than the field scrolls sideways under the pointer — reading the
+     end of a calc() shouldn't mean clicking in and arrowing to it. No scrollbar: the
+     field is 26px tall and one would eat half of it. `contain` keeps a flick at
+     either end from scrolling the panel behind it. */
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  /* Full-height line box, so the CARET is centred too. An empty contenteditable has
+     no content to centre — the caret is drawn from the element's own strut, which at
+     a 1.5 line-height sat against the top of the field while the placeholder beside
+     it looked centred. At the field's height the strut fills it, the way an input's
+     caret does; the flex centring still places the text and the chips. */
+  line-height: var(--size-input);
   cursor: text;
 }
 /* The atomic chip (contenteditable=false): click to re-open the picker and switch. */
@@ -4193,6 +4513,11 @@ textarea.embed-editor_value-input.is-expanded {
 }
 .embed-editor_varconnect-editor:focus .embed-editor_varconnect-token,
 .embed-editor_varconnect-token:hover { background: rgba(124, 92, 255, 0.42); }
+
+/* The gap between two chips (see spaceRun). `pre` so the space keeps its width —
+   the field's own `nowrap` collapses runs — and it stays selectable, which is
+   what makes the caret land between the chips. */
+.embed-editor_varconnect-space { white-space: pre; }
 .embed-editor_varconnect-token-icon { flex: none; display: inline-flex; }
 .embed-editor_varconnect-token-icon svg { width: 12px; height: 12px; display: block; }
 .embed-editor_varconnect-token-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px; }
@@ -4293,4 +4618,98 @@ textarea.embed-editor_value-input.is-expanded {
   color: var(--color-text-tertiary);
   font-family: var(--font-family-mono);
   font-size: var(--font-size-xs);
+}
+
+/* Reveals the selectors that match nearly every element (:target,
+   :focus-visible, *) — off by default so the list reads as what's actually on
+   this element. Sits under the well, not in it: it isn't a selector to pick. */
+.embed-editor_globals-check {
+  margin-top: calc(var(--space-1) * -1);
+  user-select: none;
+}
+
+/* ── Transform settings (the ⋯ beside the transform list's +) ────────────────
+   Origin, backface, and the two perspectives — element-wide settings, so they
+   sit here rather than in the per-layer editor. The origin rows reuse the
+   gradient centre's pad and fields wholesale; only the frame is new. */
+.embed-editor_bg-layers-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+.embed-editor_tsettings {
+  display: flex;
+  flex-direction: column;
+}
+.embed-editor_tsettings-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3) 0;
+}
+.embed-editor_tsettings-section + .embed-editor_tsettings-section {
+  border-top: 1px solid var(--color-border);
+}
+.embed-editor_tsettings-section:first-child { padding-top: 0; }
+.embed-editor_tsettings-section:last-child { padding-bottom: 0; }
+.embed-editor_tsettings-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.embed-editor_tsettings-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+/* The ? beside a heading whose meaning is genuinely not guessable from its name
+   — "children perspective" changes nothing about the element it is set on. */
+.embed-editor_tsettings-help {
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-text-tertiary);
+  cursor: help;
+}
+.embed-editor_tsettings-help:hover { color: var(--color-text-secondary); }
+/* The unit beside a distance, matching the gradient number's trailing unit. */
+.embed-editor_tsettings-unit {
+  flex: none;
+  font-size: var(--font-size-2xs);
+  color: var(--color-text-tertiary);
+  text-transform: uppercase;
+}
+
+/* ── The panel's value field ──────────────────────────────────────────────── */
+/* The input, plus whatever belongs inside the box with it — a unit (`%`, `DEG`)
+   that is part of the field rather than part of the value. The BOX carries the
+   inset and the focus ring, not the input: a ring drawn around the input alone
+   leaves the unit standing outside the field it belongs to, which is what the
+   position popup used to look like. */
+.embed-editor_field {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  border-radius: var(--radius-input);
+  background: var(--color-bg-inset);
+  transition: box-shadow var(--transition-fast);
+}
+.embed-editor_field:focus-within {
+  box-shadow: 0 0 0 var(--border-width-default) var(--color-border-focus);
+}
+/* The input in it is the same input as everywhere else, less the chrome the box
+   now provides — including its own ring, which would draw a second one inside, and
+   its own surface: the box is the surface, so the input stays transparent even
+   focused (`.u-input:focus` restates a background for the fields that ARE the box). */
+.embed-editor_field .u-input {
+  --u-input-bg: transparent;
+  min-width: 0;
+}
+.embed-editor_field .u-input:focus { box-shadow: none; }
+.embed-editor_field-suffix {
+  flex: none;
+  padding-right: var(--space-3);
+  font-size: var(--font-size-2xs);
+  color: var(--color-text-tertiary);
+  text-transform: uppercase; /* DEG / % — Webflow shows the unit uppercase */
 }

@@ -1,6 +1,12 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { cleanError } from '../App.jsx';
-import { BranchIcon, CheckIcon, ExternalIcon, CloseIcon } from '../ui/Icons.jsx';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { cleanError } from '../cleanError.js';
+import { BranchIcon, CheckIcon, ExternalIcon, CloseIcon, MergeIcon, TrashIcon } from '../ui/Icons.jsx';
+import { branchNameError, sanitizeBranchName } from '../branchName.js';
+import { mergeBranchAction, deleteBranchAction, tidyUp } from '../gitActions.js';
+import Code from '../ui/Code.jsx';
+import FileBrowser from '../ui/FileBrowser.jsx';
+import BranchActions from '../ui/BranchActions.jsx';
+import useDismiss from '../ui/useDismiss.js';
 
 // owner/repo out of any GitHub remote form (https or ssh), for display.
 const repoSlug = (url) => {
@@ -26,6 +32,13 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
   const working = busy !== null;
   const [showPublish, setShowPublish] = useState(false);
   const [switchTo, setSwitchTo] = useState(null); // branch awaiting a dirty-tree decision
+  const [conflict, setConflict] = useState(null); // {branch, from, files:[{path,ours,theirs}]}
+  // Which files this commit will include. `null` means "all of them", which is
+  // what the button has always done — the list only appears once someone opens
+  // it, so the common case is unchanged and picking is a thing you go and do.
+  const [picked, setPicked] = useState(null);
+  const [changed, setChanged] = useState([]);
+  const [picking, setPicking] = useState(false);
   const wrapRef = useRef(null);
 
   const refresh = async () => {
@@ -40,13 +53,29 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
     return () => clearInterval(t);
   }, [project.path]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Closes on a click anywhere else — including into the canvas, which is an
+  // iframe and so raises its clicks in a document this one never hears. See
+  // useDismiss.
+  useDismiss(
+    wrapRef,
+    open,
+    useCallback(() => setOpen(false), [])
+  );
+
+  // The full list, not the capped summary git:info carries for the chip: a
+  // file missing from this list is a file that silently cannot be saved.
   useEffect(() => {
-    const onDown = (e) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
-    };
-    document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
-  }, []);
+    if (!picking || !open) return;
+    window.avb
+      .gitStatus({ projectPath: project.path })
+      .then((f) => {
+        setChanged(f || []);
+        // Everything ticked to begin with, so opening the list and pressing
+        // save does what pressing save without opening it would have done.
+        setPicked((cur) => (cur === null ? (f || []).map((x) => x.path) : cur));
+      })
+      .catch(() => setChanged([]));
+  }, [picking, open, project.path, info?.dirty, info?.head]);
 
   const act = async (fn, successMsg, label = 'Working…') => {
     setBusy(label);
@@ -74,18 +103,42 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
     return true;
   };
 
-  // Git carries uncommitted changes across a checkout, and this editor saves
-  // to disk constantly — so without asking first, work done on one branch
-  // silently follows you to the next and gets committed there. Switching with
-  // a dirty tree stops here and makes the choice explicit.
+  // Just switch.
+  //
+  // Git carries uncommitted work across a switch by itself whenever the files
+  // involved do not differ between the two branches, which is nearly always.
+  // Asking first turned that ordinary case into a dialog about a problem that
+  // was not going to happen.
+  //
+  // It still matters that the work moved — this editor saves to disk
+  // constantly, so changes following you to another branch is exactly how they
+  // get committed somewhere they do not belong. That is said afterwards, in
+  // the toast, rather than asked beforehand.
+  //
+  // The question only gets put when git refuses, which it does cleanly and
+  // without moving HEAD, and only for the files it names.
   const requestSwitch = (branch) => {
     if (branch === info.branch) return;
-    if (info.dirty) {
-      setSwitchTo(branch);
-      setOpen(false);
-      return;
-    }
-    switchNow(branch);
+    const wasDirty = info.dirty;
+    setOpen(false);
+    act(
+      async () => {
+        const r = await window.avb.gitCheckout({ projectPath: project.path, branch });
+        if (r?.blocked) {
+          // These files differ between the branches, so the work genuinely
+          // cannot come along. Now there is something to decide.
+          setSwitchTo({ branch, files: r.files || [] });
+          setOpen(true);
+          return;
+        }
+        if (r?.error) showToast(r.error, 'error');
+        else if (r?.restored) showToast(`Picked your changes back up on ${branch}`, 'success');
+        else if (wasDirty) showToast(`On ${branch} — your changes came with you`, 'success');
+        else showToast(`Switched to ${branch}`, 'success');
+      },
+      null,
+      'Switching…'
+    );
   };
 
   const switchNow = (branch) =>
@@ -94,6 +147,53 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
       `Switched to ${branch}`,
       'Switching…'
     );
+
+  // Leave the work where it was written and pick it up again on the way back.
+  // No commit, nothing carried onto a branch it does not belong to.
+  const parkThenSwitch = (branch) => {
+    const from = info.branch;
+    return act(
+      async () => {
+        const r = await window.avb.gitCheckout({
+          projectPath: project.path,
+          branch,
+          parkFirst: true,
+        });
+        // The switch worked; anything else to say is about the changes.
+        if (r?.error) showToast(r.error, 'error');
+        else if (r?.restored) showToast(`Picked your changes back up on ${branch}`, 'success');
+        return r;
+      },
+      `On ${branch} — your changes are waiting on ${from}`,
+      'Switching…'
+    );
+  };
+
+  // Both live in gitActions.js — the History panel offers the same two, and
+  // they should ask the same questions in the same words wherever they are.
+  // `act` is what differs: it is this component's busy state and error box.
+  const mergeBranch = (branch) =>
+    mergeBranchAction({
+      projectPath: project.path,
+      branch,
+      into: info.branch,
+      trunk: info.trunk,
+      run: (fn, label) => act(fn, null, label),
+      showToast,
+      onConflict: (r) => {
+        setConflict(r);
+        setOpen(false);
+      },
+    });
+
+  const deleteBranch = (branch) =>
+    deleteBranchAction({
+      projectPath: project.path,
+      branch,
+      parked: (info.parked || []).includes(branch),
+      run: (fn, label) => act(fn, null, label),
+      showToast,
+    });
 
   const commitThenSwitch = (branch, message) => {
     const from = info.branch;
@@ -155,14 +255,21 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
     );
   }
 
+  // Everything is `paths: undefined` — the same call the button has always
+  // made. Only a list narrowed by hand is sent as one.
+  const allPicked = !picking || picked === null || picked.length === changed.length;
   const commit = () => {
     const message = commitMsg.trim() || 'Update from Stacki';
+    const paths = allPicked ? undefined : picked;
     setCommitMsg('');
     act(
-      () => window.avb.gitCommit({ projectPath: project.path, message }),
-      'Changes committed',
+      () => window.avb.gitCommit({ projectPath: project.path, message, paths }),
+      paths ? `Saved ${paths.length} file${paths.length === 1 ? '' : 's'}` : 'Changes committed',
       'Committing…'
-    );
+    ).then(() => {
+      setPicked(null);
+      setPicking(false);
+    });
   };
 
   // Three distinct states, because "0 commits ahead" and "never pushed" mean
@@ -173,6 +280,9 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
       ? `Push ${info.ahead} commit${info.ahead === 1 ? '' : 's'}`
       : 'Everything pushed';
   const canPush = info.hasUpstream ? info.ahead > 0 : true;
+  // Why this name can't be created, or null. Checked against the branches that
+  // exist, so "already taken" is caught here rather than by git.
+  const branchError = branchNameError(newBranch, info.branches || []);
 
   return (
     <div ref={wrapRef} style={{ position: 'relative' }}>
@@ -219,15 +329,35 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
                 {b === info.branch ? <CheckIcon size={12} /> : null}
               </span>
               <span className="label">{b}</span>
+              {(info.parked || []).includes(b) && b !== info.branch && (
+                <span className="branch-parked" title="Changes waiting on this branch">
+                  changes waiting
+                </span>
+              )}
+              <BranchActions
+                branch={b}
+                current={info.branch}
+                trunk={info.trunk}
+                disabled={working}
+                onMerge={mergeBranch}
+                onDelete={deleteBranch}
+              />
             </div>
           ))}
+          {/* The rules git checks are checked here instead, where the name is
+              being typed: a character it refuses never lands in the field, and
+              what's left — the shape of the whole name, a name already taken —
+              is said before Enter does anything. Sending it and reporting back
+              "fatal: 'my branch' is not a valid branch name" loses the name and
+              explains it in git's words. */}
           <div className="dropdown-row">
             <input
               placeholder="new-branch-name"
               value={newBranch}
-              onChange={(e) => setNewBranch(e.target.value)}
+              aria-invalid={!!branchError}
+              onChange={(e) => setNewBranch(sanitizeBranchName(e.target.value))}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && newBranch.trim()) {
+                if (e.key === 'Enter' && newBranch.trim() && !branchError) {
                   const name = newBranch.trim();
                   setNewBranch('');
                   act(
@@ -244,6 +374,7 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
               }}
             />
           </div>
+          {branchError && <div className="git-hint">{branchError}</div>}
 
           <div className="divider" />
           <h3>Commit</h3>
@@ -256,8 +387,49 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
                 if (e.key === 'Enter' && info.dirty && !working) commit();
               }}
             />
-            <button disabled={working || !info.dirty} onClick={commit}>
-              {info.dirty ? 'Commit all changes' : 'Nothing to commit'}
+            {/* The list is closed by default. Someone who just wants to save
+                everything should never have to look at a file list to do it —
+                that is the whole difference between this and a git client. */}
+            {info.dirty && (
+              <button
+                className="git-pick-toggle"
+                onClick={() => setPicking((v) => !v)}
+              >
+                {picking ? 'Commit everything instead' : 'Choose what to commit…'}
+              </button>
+            )}
+
+            {picking && info.dirty && (
+              <div className="git-pick">
+                {/* The same browser the History panel shows, in picking mode.
+                    Only the changed files here: committing is about what has
+                    changed, and the rest of the project would be a haystack
+                    around the needle. */}
+                <FileBrowser
+                  files={changed}
+                  selectable
+                  selected={picked || []}
+                  onSelect={setPicked}
+                  emptyMessage="Nothing has changed."
+                  autoFocusSearch
+                />
+              </div>
+            )}
+
+            <button
+              className="primary"
+              disabled={working || !info.dirty || (picking && !(picked || []).length)}
+              onClick={commit}
+            >
+              {/* When the list is open and everything happens to be ticked,
+                  "Commit all changes" is true but reads as if the picking was
+                  ignored. Say the count instead — it matches what is on
+                  screen. */}
+              {!info.dirty
+                ? 'Nothing to commit'
+                : !picking
+                  ? 'Commit all changes'
+                  : `Commit ${(picked || []).length} file${(picked || []).length === 1 ? '' : 's'}`}
             </button>
           </div>
 
@@ -315,18 +487,53 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
         </div>
       )}
 
+      {conflict && (
+        <MergeConflictModal
+          conflict={conflict}
+          busy={busy}
+          onCancel={() => setConflict(null)}
+          onResolve={async (choices) => {
+            const done = await act(
+              async () => {
+                const r = await window.avb.gitResolveMerge({
+                  projectPath: project.path,
+                  branch: conflict.branch,
+                  choices,
+                });
+                // The tidy-up was chosen back when the merge was started, before
+                // anyone knew it would clash. It still applies now it is settled.
+                if (conflict.deleteAfter) {
+                  await tidyUp({
+                    projectPath: project.path,
+                    branch: conflict.branch,
+                    into: r.into,
+                    changed: true,
+                    showToast,
+                  });
+                } else {
+                  showToast(`Merged ${conflict.branch} into ${r.into}`, 'success');
+                }
+              },
+              null,
+              'Merging…'
+            );
+            if (done) setConflict(null);
+          }}
+        />
+      )}
+
       {switchTo && (
         <SwitchBranchModal
           from={info.branch}
-          to={switchTo}
-          files={info.dirtyFiles || []}
+          to={switchTo.branch}
+          files={switchTo.files}
           busy={busy}
           onCancel={() => setSwitchTo(null)}
-          onTakeAlong={async () => {
-            if (await switchNow(switchTo)) setSwitchTo(null);
+          onLeaveHere={async () => {
+            if (await parkThenSwitch(switchTo.branch)) setSwitchTo(null);
           }}
           onCommitFirst={async (message) => {
-            if (await commitThenSwitch(switchTo, message)) setSwitchTo(null);
+            if (await commitThenSwitch(switchTo.branch, message)) setSwitchTo(null);
           }}
         />
       )}
@@ -344,11 +551,270 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
   );
 }
 
+// Both branches changed the same file, so somebody has to say which version
+// wins. That is a choice, not an error — and it is a choice a designer can
+// make perfectly well when it is put as "which of these two", with both
+// versions in front of them. The old behaviour here was to give up and name a
+// terminal command, which in an app built so that people never need one was
+// really just a refusal.
+//
+// One decision per file, because that is how the clash actually is: a merge
+// where the page should come from one branch and the stylesheet from the other
+// is completely ordinary, and a single all-or-nothing switch cannot express it.
+// One file at a time, because a merge that touched twenty of them is not
+// twenty things to read at once. The list on the left says which files still
+// want attention; the panel on the right is the one file's differences, each
+// with both versions and a choice.
+//
+// Most differences arrive already answered. Where only one branch changed
+// something there is nothing to disagree about, and where both changed the
+// same lines in different places — a class added here, the words rewritten
+// there — the two edits are combined. What is left in front of the user is the
+// small number of places the branches genuinely contradict each other.
+function MergeConflictModal({ conflict, busy, onCancel, onResolve }) {
+  const working = !!busy;
+
+  const clashesOf = (f) => (f.parts || []).filter((p) => p.kind === 'clash');
+  // The answer that needs no thought, per difference: the side that made the
+  // change, or both when they were found not to overlap.
+  const defaultPick = (c) => (c.merged != null ? 'merged' : c.changedBy === 'theirs' ? 'theirs' : 'ours');
+
+  const [picks, setPicks] = useState(() =>
+    Object.fromEntries(conflict.files.map((f) => [f.path, clashesOf(f).map(defaultPick)]))
+  );
+  const [openPath, setOpenPath] = useState(conflict.files[0]?.path || null);
+
+  const file = conflict.files.find((f) => f.path === openPath) || conflict.files[0];
+  const clashes = file ? clashesOf(file) : [];
+
+  const setOne = (path, i, side) =>
+    setPicks((cur) => ({ ...cur, [path]: cur[path].map((v, n) => (n === i ? side : v)) }));
+  const setAll = (path, side) =>
+    setPicks((cur) => ({ ...cur, [path]: cur[path].map(() => side) }));
+
+  // How many places in a file the branches really contradict each other, and
+  // so how much of it is worth anybody's time.
+  const contestedIn = (f) => clashesOf(f).filter((c) => c.changedBy === 'both' && c.merged == null).length;
+  const totalContested = conflict.files.reduce((n, f) => n + contestedIn(f), 0);
+
+  const sideOf = (c, pick) => (pick === 'theirs' ? 'theirs' : pick === 'merged' ? 'merged' : 'ours');
+
+  const choicesForSend = () =>
+    Object.fromEntries(
+      conflict.files.map((f) => {
+        const list = picks[f.path] || [];
+        if (!f.parts || !list.length) return [f.path, list[0] === 'theirs' ? 'theirs' : 'ours'];
+        return [f.path, list];
+      })
+    );
+
+  // A line either side of a difference, so it can be placed in the file
+  // without the whole file being on screen.
+  const contextAround = (parts, clashIndex) => {
+    let seen = -1;
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i].kind !== 'clash') continue;
+      seen++;
+      if (seen !== clashIndex) continue;
+      const before = parts[i - 1]?.kind === 'same' ? parts[i - 1].text.split('\n').filter(Boolean).slice(-1)[0] : null;
+      const after = parts[i + 1]?.kind === 'same' ? parts[i + 1].text.split('\n').filter(Boolean)[0] : null;
+      return { before, after };
+    }
+    return { before: null, after: null };
+  };
+
+  const label = (c) =>
+    c.merged != null
+      ? 'Both branches changed this line, in different places'
+      : c.changedBy === 'both'
+        ? 'Both branches changed this'
+        : `Only ${c.changedBy === 'theirs' ? conflict.branch : conflict.from} changed this`;
+
+  return (
+    <div
+      className="modal-overlay"
+      onMouseDown={(e) => e.target === e.currentTarget && !working && onCancel()}
+    >
+      <div className="modal conflict-modal">
+        <div className="modal-header">Both branches changed the same thing</div>
+        <div className="conflict-intro hint-text">
+          {totalContested === 0 ? (
+            <>
+              Every difference could be worked out on its own — each change was made on only one
+              branch, or in a different part of the same line. Look it over and merge.
+            </>
+          ) : (
+            <>
+              {totalContested === 1 ? 'One place' : `${totalContested} places`} where{' '}
+              <strong>{conflict.from}</strong> and <strong>{conflict.branch}</strong> really
+              disagree. The rest is already worked out.
+            </>
+          )}
+        </div>
+
+        <div className="conflict-split">
+          <div className="conflict-files">
+            {conflict.files.map((f) => {
+              const left = contestedIn(f);
+              return (
+                <button
+                  key={f.path}
+                  className={`conflict-file-row ${f.path === openPath ? 'on' : ''}`}
+                  onClick={() => setOpenPath(f.path)}
+                  title={f.path}
+                >
+                  <span className="conflict-file-name">{f.path.split('/').pop()}</span>
+                  <span className="conflict-file-dir">{f.path.split('/').slice(0, -1).join('/')}</span>
+                  <span className={`conflict-file-badge ${left ? 'warn' : ''}`}>
+                    {left ? `${left} to decide` : 'sorted'}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="conflict-detail">
+            {!file?.parts && (
+              <div className="conflict-whole">
+                This one can only be taken whole — there’s no text in it to compare.
+                <div className="conflict-choice" style={{ marginTop: 8 }}>
+                  <button
+                    className={picks[file?.path]?.[0] !== 'theirs' ? 'on' : ''}
+                    onClick={() => setPicks((c) => ({ ...c, [file.path]: ['ours'] }))}
+                  >
+                    {conflict.from}
+                  </button>
+                  <button
+                    className={picks[file?.path]?.[0] === 'theirs' ? 'on' : ''}
+                    onClick={() => setPicks((c) => ({ ...c, [file.path]: ['theirs'] }))}
+                  >
+                    {conflict.branch}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {file?.parts && (
+              <>
+                <div className="conflict-detail-head">
+                  <span className="conflict-detail-path">{file.path}</span>
+                  <div className="conflict-choice">
+                    <button disabled={working} onClick={() => setAll(file.path, 'ours')}>
+                      All {conflict.from}
+                    </button>
+                    <button disabled={working} onClick={() => setAll(file.path, 'theirs')}>
+                      All {conflict.branch}
+                    </button>
+                  </div>
+                </div>
+
+                {clashes.map((c, i) => {
+                  const pick = picks[file.path]?.[i];
+                  const ctx = contextAround(file.parts, i);
+                  return (
+                    <div className={`conflict-hunk ${c.merged != null ? 'combined' : ''}`} key={i}>
+                      <div className="conflict-hunk-head">
+                        <span className="conflict-hunk-n">{label(c)}</span>
+                        <div className="conflict-choice">
+                          {c.merged != null && (
+                            <button
+                              className={pick === 'merged' ? 'on' : ''}
+                              disabled={working}
+                              onClick={() => setOne(file.path, i, 'merged')}
+                              title="Keep both edits — they don’t overlap"
+                            >
+                              Both edits
+                            </button>
+                          )}
+                          <button
+                            className={pick === 'ours' ? 'on' : ''}
+                            disabled={working}
+                            onClick={() => setOne(file.path, i, 'ours')}
+                          >
+                            {conflict.from}
+                          </button>
+                          <button
+                            className={pick === 'theirs' ? 'on' : ''}
+                            disabled={working}
+                            onClick={() => setOne(file.path, i, 'theirs')}
+                          >
+                            {conflict.branch}
+                          </button>
+                          {c.changedBy === 'both' && c.merged == null && (
+                            <button
+                              className={pick === 'both' ? 'on' : ''}
+                              disabled={working}
+                              onClick={() => setOne(file.path, i, 'both')}
+                              title="Keep both versions, one after the other"
+                            >
+                              Both
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Where in the file this is, without the whole file. */}
+                      {ctx.before && <div className="conflict-ctx">{ctx.before}</div>}
+
+                      {c.merged != null && pick === 'merged' ? (
+                        <div className="conflict-side kept">
+                          <div className="conflict-side-label">both edits, combined</div>
+                          <Code text={c.merged} filename={file.path} maxHeight={160} />
+                        </div>
+                      ) : (
+                        <div className="conflict-sides">
+                          {[
+                            { id: 'ours', label: conflict.from, text: c.ours },
+                            { id: 'theirs', label: conflict.branch, text: c.theirs },
+                          ].map((s) => (
+                            <div
+                              className={`conflict-side ${pick === s.id || pick === 'both' ? 'kept' : ''}`}
+                              key={s.id}
+                            >
+                              <div className="conflict-side-label">{s.label}</div>
+                              {s.text ? (
+                                <Code text={s.text} filename={file.path} maxHeight={160} />
+                              ) : (
+                                <div className="conflict-empty">(nothing)</div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {ctx.after && <div className="conflict-ctx">{ctx.after}</div>}
+                    </div>
+                  );
+                })}
+              </>
+            )}
+          </div>
+        </div>
+
+        {working && (
+          <div className="publish-progress" style={{ padding: '0 16px 8px' }}>
+            <span className="mini-spinner" />
+            <span>{busy}</span>
+          </div>
+        )}
+        <div className="modal-footer">
+          <button onClick={onCancel} disabled={working}>
+            Cancel
+          </button>
+          <button className="primary" disabled={working} onClick={() => onResolve(choicesForSend())}>
+            Merge with these choices
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Shown when a branch switch would drag uncommitted work along. Deliberately
 // has no default action: taking changes with you and leaving them behind are
 // both reasonable, and picking one silently is how the edits ended up on the
 // wrong branch in the first place.
-function SwitchBranchModal({ from, to, files, busy, onCancel, onTakeAlong, onCommitFirst }) {
+function SwitchBranchModal({ from, to, files, busy, onCancel, onLeaveHere, onCommitFirst }) {
   const [message, setMessage] = useState('');
   const working = !!busy;
   const shown = files.slice(0, 5);
@@ -360,11 +826,12 @@ function SwitchBranchModal({ from, to, files, busy, onCancel, onTakeAlong, onCom
       onMouseDown={(e) => e.target === e.currentTarget && !working && onCancel()}
     >
       <div className="modal">
-        <div className="modal-header">Uncommitted changes</div>
+        <div className="modal-header">These changes can’t come with you</div>
         <div className="modal-body">
           <div className="hint-text">
-            You have unsaved-to-git changes on <strong>{from}</strong>. Git carries them
-            across a switch, so they’d end up part of <strong>{to}</strong>.
+            {from} and {to} have different versions of{' '}
+            {files.length === 1 ? 'this file' : 'these files'}, so your unsaved work can’t
+            follow you across. It can wait here until you come back — no commit needed.
           </div>
 
           {shown.length > 0 && (
@@ -377,7 +844,7 @@ function SwitchBranchModal({ from, to, files, busy, onCancel, onTakeAlong, onCom
           )}
 
           <div>
-            <label>Commit message</label>
+            <label>Or commit them first</label>
             <input
               autoFocus
               placeholder={`Update ${from}`}
@@ -401,15 +868,20 @@ function SwitchBranchModal({ from, to, files, busy, onCancel, onTakeAlong, onCom
           <button onClick={onCancel} disabled={working}>
             Cancel
           </button>
-          <button onClick={onTakeAlong} disabled={working} title={`Leave them uncommitted and switch to ${to}`}>
-            Take changes to {to}
+          <button
+            onClick={() => onCommitFirst(message.trim() || `Update ${from}`)}
+            disabled={working}
+            title={`Commit to ${from}, then switch`}
+          >
+            Commit first
           </button>
           <button
             className="primary"
             disabled={working}
-            onClick={() => onCommitFirst(message.trim() || `Update ${from}`)}
+            onClick={onLeaveHere}
+            title={`Set them aside on ${from} and pick them up when you return`}
           >
-            Commit to {from}, then switch
+            Leave them on {from}
           </button>
         </div>
       </div>

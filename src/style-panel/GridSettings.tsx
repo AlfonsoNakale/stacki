@@ -2,10 +2,12 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { ReactNode } from 'react'
 import SegmentedControl, { type SegmentedOption } from './components/SegmentedControl'
+import useScrub from './components/useScrub'
 import VariableConnect from './VariableConnect'
 import { GroupLabel } from './TypographySection'
 import { handleArrowStep } from './lib/number-step'
-import { parseTrackList, serializeTrackList, parseTrackSize, serializeTrackSize, trackKind, trackLabel, isFixedSizeTrack, parseAreas, serializeAreas, areaLabel, nextAreaName, type TrackSize, type GridArea } from './lib/grid-template'
+import { panelSpan } from './lib/panel-box'
+import { parseTrackList, serializeTrackList, parseTrackSize, serializeTrackSize, trackKind, trackLabel, isFixedSizeTrack, parseAreas, serializeAreas, areaLabel, nextAreaName, trackForm, asTrackList, asRepeat, canEditAsTracks, type TrackSize, type GridArea } from './lib/grid-template'
 import type { ResolvedProp } from './lib/resolved'
 
 // The "Grid settings" modal (Webflow's Configure-grid popup): the Columns and Rows
@@ -30,6 +32,21 @@ const val = (read: Read, prop: string): string => {
 // ── icons ──
 const CloseIcon = () => (<svg viewBox="0 0 16 16" fill="none" aria-hidden="true" width="16" height="16"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" /></svg>)
 const PlusIcon = () => (<svg viewBox="0 0 16 16" fill="none" aria-hidden="true" width="16" height="16"><path d="M8 3.5v9M3.5 8h9" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" /></svg>)
+// The repeat()/written-out toggle. Two tracks collapsing into one boxed count,
+// or opening back out — the arrows say which way the press goes.
+const CollapseTracksIcon = () => (
+  <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" width="16" height="16">
+    <rect x="1.5" y="4.5" width="4" height="7" rx="1" stroke="currentColor" strokeWidth="1.2" />
+    <rect x="10.5" y="4.5" width="4" height="7" rx="1" stroke="currentColor" strokeWidth="1.2" />
+    <path d="M6.6 8h2.8M8.6 6.9 9.7 8 8.6 9.1M7.4 6.9 6.3 8l1.1 1.1" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+)
+const ExpandTracksIcon = () => (
+  <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" width="16" height="16">
+    <rect x="5.5" y="4.5" width="5" height="7" rx="1" stroke="currentColor" strokeWidth="1.2" />
+    <path d="M4.2 8H1.6M2.7 6.9 1.6 8l1.1 1.1M11.8 8h2.6M13.3 6.9 14.4 8l-1.1 1.1" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+)
 const TrashIcon = () => (<svg viewBox="0 0 16 16" fill="none" aria-hidden="true" className="embed-editor_bg-glyph"><path d="M3 4h10M6.5 4V3h3v1M5 4l.5 8.5a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1L11 4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" /></svg>)
 const DuplicateIcon = () => (<svg viewBox="0 0 16 16" fill="none" aria-hidden="true" className="embed-editor_bg-glyph"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.2" /><path d="M10.5 5.5V4A1.5 1.5 0 0 0 9 2.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" /></svg>)
 const GripIcon = () => (<svg viewBox="0 0 16 16" aria-hidden="true" className="embed-editor_bg-glyph"><circle cx="6" cy="4" r="1" /><circle cx="10" cy="4" r="1" /><circle cx="6" cy="8" r="1" /><circle cx="10" cy="8" r="1" /><circle cx="6" cy="12" r="1" /><circle cx="10" cy="12" r="1" /></svg>)
@@ -65,9 +82,18 @@ function TrackInput({ value, placeholder, ariaLabel, busy, onCommit }: {
   const [text, setText] = useState(value)
   const focused = useRef(false)
   useEffect(() => { if (!focused.current) setText(value) }, [value])
+  // No onInput: a track list has no preview channel, only the real write, so the drag
+  // moves the field's text and writes once on release rather than at pointer speed.
+  const scrub = useScrub({
+    value: text,
+    disabled: busy,
+    onPreview: setText,
+    onCommit: (next) => { setText(next); onCommit(next.trim()) },
+  })
   return (
-    <VariableConnect ariaLabel={`Connect ${ariaLabel} to a variable`} disabled={busy} className="is-fill" prop="grid-template-columns" onPick={(binding) => onCommit(binding)}>
+    <VariableConnect code ariaLabel={`Connect ${ariaLabel} to a variable`} disabled={busy} className="is-fill" prop="grid-template-columns" onPick={(binding) => onCommit(binding)}>
     <input
+      {...scrub.input}
       className="u-input embed-editor_size-input"
       value={text}
       spellCheck={false}
@@ -174,6 +200,10 @@ function TrackSizeEditor({ track, busy, autoFit, onChange }: { track: string; bu
 function TrackPopover({ anchorEl, onClose, children }: { anchorEl: HTMLElement; onClose: () => void; children: ReactNode }) {
   const ref = useRef<HTMLDivElement>(null)
   const [pos, setPos] = useState<{ top: number; caretLeft: number; below: boolean } | null>(null)
+  // The panel's span, read at mount so the first layout (which measures this
+  // popover's height) already has the right width. The anchor lives inside the
+  // grid modal — itself portaled — so this falls back to the published box.
+  const [span] = useState(() => panelSpan(anchorEl))
   useLayoutEffect(() => {
     const el = ref.current
     if (!el) return
@@ -182,7 +212,9 @@ function TrackPopover({ anchorEl, onClose, children }: { anchorEl: HTMLElement; 
     const h = el.offsetHeight
     const below = anchor.bottom + gap + h <= window.innerHeight
     const top = below ? anchor.bottom + gap : Math.max(gap, anchor.top - gap - h)
-    const caretLeft = Math.max(16, Math.min(anchor.left + anchor.width / 2, window.innerWidth - 16))
+    // The caret is absolutely positioned inside the popover, so its x is local
+    // to the popover's left edge — not the window's.
+    const caretLeft = Math.min(Math.max(anchor.left + anchor.width / 2 - span.left, 16), span.width - 16)
     setPos({ top, caretLeft, below })
   }, [anchorEl])
   useEffect(() => {
@@ -204,12 +236,106 @@ function TrackPopover({ anchorEl, onClose, children }: { anchorEl: HTMLElement; 
       ref={ref}
       className={`embed-editor_grid-popover ${pos && !pos.below ? 'is-above' : ''}`}
       role="dialog"
-      style={{ position: 'fixed', left: 0, right: 0, top: pos?.top ?? 0, visibility: pos == null ? 'hidden' : 'visible' }}
+      style={{ position: 'fixed', left: span.left, width: span.width, top: pos?.top ?? 0, visibility: pos == null ? 'hidden' : 'visible' }}
     >
       <span className="embed-editor_grid-popover-caret" style={{ left: pos?.caretLeft ?? 16 }} aria-hidden="true" />
       {children}
     </div>,
     document.body,
+  )
+}
+
+// The expression toggle's glyph: the braces you write one in.
+const BracesIcon = () => (
+  <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
+    <path
+      d="M6.4 2.5c-1.2 0-1.7.6-1.7 1.7v1.9c0 1-.3 1.4-1.2 1.4v1c.9 0 1.2.4 1.2 1.4v1.9c0 1.1.5 1.7 1.7 1.7M9.6 2.5c1.2 0 1.7.6 1.7 1.7v1.9c0 1 .3 1.4 1.2 1.4v1c-.9 0-1.2.4-1.2 1.4v1.9c0 1.1-.5 1.7-1.7 1.7"
+      stroke="currentColor"
+      strokeWidth="1.3"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+)
+
+// The whole track list as one field, for a value the list cannot hold: a
+// variable standing in for every track (`var(--columns)`), an !important, a
+// subgrid. The tracks are how you build a grid; this is how you say one the
+// builder has no controls for.
+//
+// It is the same editor the panel opens over a cramped field — multi-line, with
+// variables as chips and the value coloured as code — but sitting in the panel
+// rather than in a box over it. A field that already has the room does not need
+// one opened in front of it, which is what `expanded` says.
+function ExpressionField({ prop, value, title, busy, onCommit }: {
+  prop: string; value: string; title: string; busy: boolean; onCommit: (v: string, important: boolean) => void
+}) {
+  const [text, setText] = useState(value)
+  const focused = useRef(false)
+  useEffect(() => { if (!focused.current) setText(value) }, [value])
+  // Whatever is in the field is the value, `!important` included — this is the
+  // way in for everything the track controls have no way to say.
+  const commit = (typed: string) => {
+    const v = typed.trim()
+    const m = v.match(/!\s*important\s*$/i)
+    onCommit(m ? v.slice(0, m.index).trim() : v, !!m)
+  }
+  return (
+    <VariableConnect
+      className="is-multiline"
+      code
+      expanded
+      ariaLabel={`${title} expression`}
+      disabled={busy}
+      prop={prop}
+      onPick={(next) => { setText(next); commit(next) }}
+    >
+      <textarea
+        className="embed-editor_grid-expression"
+        value={text}
+        spellCheck={false}
+        rows={3}
+        disabled={busy}
+        aria-label={`${title} expression`}
+        placeholder="repeat(auto-fit, minmax(12rem, 1fr))"
+        onChange={(e) => setText(e.target.value)}
+        onFocus={() => { focused.current = true }}
+        onBlur={(e) => { focused.current = false; commit(e.currentTarget.value) }}
+        onKeyDown={(e) => {
+          // A CSS value has no need for a line break, so Enter is "done".
+          if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.currentTarget.blur() }
+        }}
+      />
+    </VariableConnect>
+  )
+}
+
+// The repeat() switch: which of the two ways this track list is written (see
+// trackForm). On, `repeat(3, 1fr)`; off, `1fr 1fr 1fr` — the same grid either
+// way, so this is about the CSS you end up reading, not the layout.
+//
+// It stays on through an edit: adding a fourth track to `repeat(3, 1fr)` writes
+// `repeat(4, 1fr)` rather than quietly writing them all out, which is what used
+// to happen. Tracks that differ cannot be a repeat() at all, so there the
+// switch is off and says why.
+function RepeatSwitch({ on, can, why, busy, title, onChange }: {
+  on: boolean; can: boolean; why: string; busy: boolean; title: string; onChange: (on: boolean) => void
+}) {
+  return (
+    <label
+      className={`embed-editor_switch ${on ? 'is-on' : ''} ${can ? '' : 'is-disabled'}`}
+      title={can ? why : `Tracks that differ can’t be written as repeat()`}
+    >
+      <input
+        type="checkbox"
+        role="switch"
+        checked={on}
+        disabled={busy || !can}
+        aria-label={`Use repeat() for ${title.toLowerCase()}`}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <span className="embed-editor_switch-label">repeat()</span>
+    </label>
   )
 }
 
@@ -220,8 +346,33 @@ function TrackSection({ title, prop, axis, setProp, labels }: {
 }) {
   const { read, busy, clearProp, onProvenance, onSelectSelector } = labels
   const rawTemplate = val(read, prop)
+  // `!important` is carried beside the value, not in it — the field shows it,
+  // since the field is where it can be typed.
+  const important = !!(read(prop)?.selectedValue ?? read(prop)?.winner)?.important
+  const shown = important && rawTemplate ? `${rawTemplate} !important` : rawTemplate
   const tracks = parseTrackList(rawTemplate)
-  const write = (next: string[]) => { const s = serializeTrackList(next); if (s) setProp(prop, s, false); else clearProp(prop) }
+  // Which way this list is written. The value answers whenever it can — it is
+  // either a repeat() or it isn't — and the preference only decides the cases
+  // where the question doesn't arise yet: no tracks, or one. A new grid is a
+  // repeat(), which is what the count stepper writes, so that is the default.
+  const form = trackForm(rawTemplate)
+  const same = (list: string[]) => list.length > 1 && list.every((x) => x === list[0])
+  const [preferRepeat, setPreferRepeat] = useState(true)
+  // A value that says which form it is IS the setting; remember it for the next
+  // time the value can't say (emptied, down to one track).
+  useEffect(() => {
+    if (form === 'repeat') setPreferRepeat(true)
+    else if (form === 'list') setPreferRepeat(false)
+  }, [form])
+  // Under two tracks there is nothing a repeat() would say differently, so the
+  // switch stays available and simply waits.
+  const canRepeat = tracks.length < 2 || same(tracks)
+  const repeatOn = form === 'repeat' ? true : form === 'list' ? false : canRepeat && preferRepeat
+  // Every edit writes the list back in the form the switch is showing, so
+  // adding a track to a repeat() keeps it one.
+  const asWritten = (next: string[]) =>
+    repeatOn && same(next) ? `repeat(${next.length}, ${next[0]})` : serializeTrackList(next)
+  const write = (next: string[]) => { const s = asWritten(next); if (s) setProp(prop, s, false); else clearProp(prop) }
   // Auto-fit wraps the whole track list in repeat(auto-fit, …) — valid only when every
   // track is a `<fixed-size>` (a fixed length or a minmax() with a fixed min, e.g.
   // minmax(20rem, 1fr)); otherwise the warning explains why.
@@ -242,6 +393,14 @@ function TrackSection({ title, prop, axis, setProp, labels }: {
       }
     },
   }
+  // Editing the value as text rather than as tracks. Asked for with the braces
+  // — or forced, when the value is one the track list cannot hold: showing
+  // `var(--columns)` or an !important as tracks would read it as a track with a
+  // strange name, and the first edit would write that reading back over it. In
+  // that case the braces are pressed and stuck, which is the honest state.
+  const [expression, setExpression] = useState(false)
+  const tracksCanHold = canEditAsTracks(important ? `${rawTemplate} !important` : rawTemplate)
+  const asExpression = expression || !tracksCanHold
   const [open, setOpen] = useState<number | null>(null)
   const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null)
   const [dragFrom, setDragFrom] = useState<number | null>(null)
@@ -255,7 +414,15 @@ function TrackSection({ title, prop, axis, setProp, labels }: {
   // New tracks use Webflow's defaults: a column is minmax(0px, 1fr) (fills its share but can
   // shrink so content can't overflow the grid), a row is auto (content-sized). The min needs
   // a unit — a bare `0` makes Webflow read the whole grid-template as a custom value.
-  const add = () => { write([...tracks, axis === 'column' ? 'minmax(0px, 1fr)' : 'auto']); setOpen(tracks.length) }
+  // Adding to a list whose tracks are all the same adds another of THOSE — a
+  // fourth column of `repeat(3, 1fr)` is a 1fr, not the generic default, which
+  // would differ by a character (`minmax(0px, 1fr)` vs `minmax(0, 1fr)`) and
+  // quietly break the list into one that can no longer be a repeat().
+  const add = () => {
+    const fresh = same(tracks) ? tracks[0] : axis === 'column' ? 'minmax(0px, 1fr)' : 'auto'
+    write([...tracks, fresh])
+    setOpen(tracks.length)
+  }
   const remove = (i: number) => {
     write(tracks.filter((_, k) => k !== i))
     setOpen((o) => (o === i ? null : o != null && o > i ? o - 1 : o))
@@ -274,13 +441,57 @@ function TrackSection({ title, prop, axis, setProp, labels }: {
   return (
     <section className="embed-editor_grid-section">
       <div className="embed-editor_grid-section-head">
+        {/* Label, then how the value is written, then the field for writing it
+            by hand — all packed left, so the eye reads along the row instead of
+            crossing a gap between them. The + stays where every other section
+            keeps its add. */}
         <span className="embed-editor_grid-section-title">
           <GroupLabel label={title} props={[prop]} read={read} busy={busy} onClear={() => clearProp(prop)} onProvenance={onProvenance} onSelectSelector={onSelectSelector} />
           <span className="embed-editor_grid-section-count">({tracks.length})</span>
         </span>
-        <button type="button" className="embed-editor_icon-btn" onClick={add} disabled={busy} title={`Add a ${title.toLowerCase().replace(/s$/, '')}`} aria-label={`Add a ${title}`}><PlusIcon /></button>
+        <RepeatSwitch
+          on={repeatOn}
+          can={canRepeat && !asExpression}
+          why={repeatOn ? `Written as repeat(${tracks.length}, …)` : 'Write these tracks as repeat()'}
+          busy={busy}
+          title={title}
+          onChange={(next) => {
+            setPreferRepeat(next)
+            if (!tracks.length) return
+            const value = next ? asRepeat(rawTemplate) : asTrackList(rawTemplate)
+            if (value) setProp(prop, value, false)
+          }}
+        />
+        <button
+          type="button"
+          className={`embed-editor_icon-btn ${asExpression ? 'is-active' : ''}`}
+          disabled={busy || !tracksCanHold}
+          aria-pressed={asExpression}
+          aria-label={`Edit ${title.toLowerCase()} as an expression`}
+          title={
+            !tracksCanHold
+              ? 'This value can’t be shown as tracks'
+              : asExpression
+                ? 'Back to tracks'
+                : 'Edit the whole value as an expression'
+          }
+          onClick={() => setExpression((v) => !v)}
+        >
+          <BracesIcon />
+        </button>
+        {asExpression ? null : (
+          <button type="button" className="embed-editor_icon-btn" onClick={add} disabled={busy} title={`Add a ${title.toLowerCase().replace(/s$/, '')}`} aria-label={`Add a ${title}`}><PlusIcon /></button>
+        )}
       </div>
-      {tracks.length ? (
+      {asExpression ? (
+        <ExpressionField
+          prop={prop}
+          value={shown}
+          title={title}
+          busy={busy}
+          onCommit={(v, imp) => { if (v) setProp(prop, v, imp); else clearProp(prop) }}
+        />
+      ) : tracks.length ? (
         <ul className="embed-editor_grid-track-list">
           {tracks.map((track, i) => {
             const isOpen = open === i
@@ -532,7 +743,7 @@ function Modal({ onClose, children }: { onClose: () => void; children: ReactNode
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
   return createPortal(
-    <div className="embed-editor_bg-modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose() }}>
+    <div className="embed-editor_bg-modal-backdrop style-panel-surface" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose() }}>
       <div className="embed-editor_grid-modal u-surface-surface" role="dialog" aria-modal="true" aria-label="Grid settings">
         <div className="embed-editor_grid-modal-head">
           <span className="embed-editor_grid-modal-title">Grid settings</span>

@@ -1,6 +1,8 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import type { MouseEvent, ReactNode } from 'react'
 import { panelBounds } from '../lib/panel-box'
+import { useHoverTip } from './PropTip'
+import type { ScrubHandlers } from './useScrub'
 
 type Props = {
   children: ReactNode
@@ -21,7 +23,16 @@ type Props = {
   /** Forwarded to the label so it can double as a drag handle (a drag suppresses
    *  the click, so mousedown-to-drag and click-to-open-menu coexist). */
   onMouseDown?: (event: MouseEvent<HTMLElement>) => void
+  /** Pointer handlers from useScrub, making the label a drag handle for the number in
+   *  the field it captions. Same coexistence rule as onMouseDown: a drag eats the click,
+   *  a press that stays put still opens the reset menu. Inert while the field is empty —
+   *  the dim caption doesn't take pointer events, and there'd be nothing to drag. */
+  scrubProps?: ScrubHandlers
   className?: string
+  /** Shown in a hover tooltip after a short delay, in every state (blue or dim) —
+   *  the panel uses it to name the CSS property this label writes. When given, it
+   *  replaces the native `title`, which becomes a note line inside the tooltip. */
+  tooltip?: ReactNode
 }
 
 /**
@@ -30,12 +41,18 @@ type Props = {
  * to reset the field; Option/Alt-clicking it resets immediately. Reusable across
  * tools for any "clearable" input.
  */
-export default function FieldLabel({ children, active, onReset, resetLabel = 'Reset', disabled = false, title, menuNote, onMouseDown, className }: Props) {
+export default function FieldLabel({ children, active, onReset, resetLabel = 'Reset', disabled = false, title, menuNote, onMouseDown, scrubProps, className, tooltip }: Props) {
   const [open, setOpen] = useState(false)
   const [dropUp, setDropUp] = useState(false)
-  const rootRef = useRef<HTMLSpanElement>(null)
+  const rootRef = useRef<HTMLSpanElement | null>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const menuId = useId()
+  // The hover tooltip anchors to whichever element this state renders (the dim
+  // caption's span or the active pill's wrapper) and swallows the native `title`.
+  const hoverTip = useHoverTip<HTMLSpanElement>(
+    tooltip ? <>{tooltip}{title ? <div className="u-prop-tip-note">{title}</div> : null}</> : null,
+  )
+  const nativeTitle = tooltip ? undefined : title
 
   // Close on outside click / Escape while open.
   useEffect(() => {
@@ -92,8 +109,19 @@ export default function FieldLabel({ children, active, onReset, resetLabel = 'Re
 
   if (!active) {
     return (
-      <span className={['u-field-label', className].filter(Boolean).join(' ')} title={title} onMouseDown={onMouseDown}>
+      // A dim caption is normally click-through (it can sit over the field it
+      // labels); one with a tooltip takes pointer events so it can be hovered.
+      // `scrubProps` is the drag that changes the value it labels.
+      <span
+        ref={hoverTip.ref}
+        className={['u-field-label', tooltip ? 'is-hoverable' : '', className].filter(Boolean).join(' ')}
+        title={nativeTitle}
+        onMouseDown={onMouseDown}
+        {...scrubProps}
+        {...hoverTip.hoverProps}
+      >
         {children}
+        {hoverTip.tip}
       </span>
     )
   }
@@ -106,6 +134,7 @@ export default function FieldLabel({ children, active, onReset, resetLabel = 'Re
   const onLabelClick = (event: MouseEvent<HTMLButtonElement>) => {
     // preventDefault so this works even when nested in a <label>.
     event.preventDefault()
+    hoverTip.hide()
     if (disabled) return
     if (event.altKey) {
       reset()
@@ -115,7 +144,11 @@ export default function FieldLabel({ children, active, onReset, resetLabel = 'Re
   }
 
   return (
-    <span ref={rootRef} className={['u-field-label-wrap', className].filter(Boolean).join(' ')}>
+    <span
+      ref={(el) => { rootRef.current = el; hoverTip.ref.current = el }}
+      className={['u-field-label-wrap', className].filter(Boolean).join(' ')}
+      {...hoverTip.hoverProps}
+    >
       <button
         type="button"
         className="u-field-label is-active"
@@ -123,8 +156,9 @@ export default function FieldLabel({ children, active, onReset, resetLabel = 'Re
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
         disabled={disabled}
-        title={title}
+        title={nativeTitle}
         onMouseDown={onMouseDown}
+        {...scrubProps}
         onClick={onLabelClick}
       >
         {children}
@@ -160,6 +194,9 @@ export default function FieldLabel({ children, active, onReset, resetLabel = 'Re
           ) : null}
         </div>
       ) : null}
+      {/* Portaled to <body>, so nesting it here costs nothing but keeps it with
+          the element it's anchored to. */}
+      {hoverTip.tip}
     </span>
   )
 }

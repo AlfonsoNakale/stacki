@@ -2,17 +2,25 @@ import React, { useEffect, useRef, useState } from 'react';
 import { canContainTag } from '../elementSchemas.js';
 import { isDataBound } from '../bindings.js';
 import { setDrag, clearDrag, getDrag } from '../dragState.js';
+import { elementLabel } from '../classNames.js';
+import { hidesChildRows, noteText } from '../treeSelection.js';
+import { thenBranch, rowChildren, rowHost } from '../branches.js';
 import {
   LayoutIcon,
   ElementComponentIcon,
+  astroAssetIcon,
   TextIcon,
   CommentIcon,
   CodeIcon,
   ChevronRightIcon,
+  HideIcon,
+  PointerEventsNoneIcon,
   ChevronDownIcon,
   DragIcon,
   FileIcon,
   RepeatIcon,
+  BranchIcon,
+  CornerIcon,
   ExpandVerticalIcon,
   CollapseVerticalIcon,
   elementIcon,
@@ -28,9 +36,14 @@ import {
 //  - collapse/expand for nodes with children
 export default function StructurePanel({
   pageState,
+  currentPage,
   layouts,
   currentLayoutName,
   selectedId,
+  emptyNodeIds,
+  hiddenNodeIds,
+  inertNodeIds,
+  liveClassesById,
   revealTick,
   onSelect,
   onHoverNode,
@@ -95,15 +108,13 @@ export default function StructurePanel({
       else if (e.key === 'ArrowUp') next = parent;
       else if (
         e.key === 'ArrowDown' &&
-        Array.isArray(node.children) &&
-        node.children.length > 0 &&
-        // Content-only children aren't shown in the navigator — don't
-        // descend into rows that don't exist.
-        !node.children.every(isContentOnlyChild)
+        rowChildren(node).length > 0 &&
+        // Children left to the Content field have no rows to descend into.
+        !hidesChildRows(node, rowChildren(node))
       ) {
         const collapsed = toggled.has(node.id) ? toggled.get(node.id) : defaultCollapsed(node);
         if (collapsed) setToggled((prev) => new Map(prev).set(node.id, false));
-        next = node.children[0];
+        next = rowChildren(node)[0];
       }
       if (next) onSelect(next.id);
     };
@@ -122,7 +133,7 @@ export default function StructurePanel({
           chain.push(...trail);
           return true;
         }
-        if (Array.isArray(n.children) && walk(n.children, [...trail, n])) return true;
+        if (walk(rowChildren(n), [...trail, n])) return true;
       }
       return false;
     };
@@ -165,12 +176,27 @@ export default function StructurePanel({
   }, [revealTick, selectedId]);
 
   if (!pageState) {
+    // A route with no file in this project: an integration injected it, and its
+    // source lives in a dependency. It previews, and that is all — saying so
+    // beats an empty panel that reads as something being broken.
+    const injected = currentPage?.kind === 'route';
     return (
       <div className="panel-section grow">
         <div className="panel-header">
           <h2>Navigator</h2>
         </div>
-        <div className="props-empty">Select a page to edit.</div>
+        <div className="props-empty">
+          {injected ? (
+            <>
+              <strong>{currentPage.route}</strong> comes from{' '}
+              {currentPage.from ? <code>{currentPage.from}</code> : 'an integration'}, not from this
+              project — it can be previewed here, but its markup lives in a dependency and isn’t
+              editable.
+            </>
+          ) : (
+            'Select a page to edit.'
+          )}
+        </div>
       </div>
     );
   }
@@ -225,9 +251,9 @@ export default function StructurePanel({
     const map = new Map();
     const walk = (list) =>
       list.forEach((n) => {
-        if (Array.isArray(n.children) && n.children.length > 0) {
+        if (rowChildren(n).length > 0) {
           map.set(n.id, collapsed);
-          walk(n.children);
+          walk(rowChildren(n));
         }
       });
     walk(model.nodes);
@@ -280,6 +306,10 @@ export default function StructurePanel({
           parentId={null}
           depth={0}
           selectedId={selectedId}
+          emptyNodeIds={emptyNodeIds}
+          hiddenNodeIds={hiddenNodeIds}
+          inertNodeIds={inertNodeIds}
+          liveClassesById={liveClassesById}
           currentLayoutName={currentLayoutName}
           onChangeLayout={onChangeLayout}
           onHoverNode={onHoverNode}
@@ -388,15 +418,50 @@ function ContextMenu({ pos, canPaste, onClose, onAction }) {
   );
 }
 
+// Kinds a comment can be a note *for* — the ones that read as a thing on the
+// page. A comment above another comment (or above text) keeps its own row.
+const ANNOTATABLE = new Set(['element', 'component']);
+
 function NodeList({ nodes, parentId, depth, ...ctx }) {
+  // A comment directly above an element belongs to it: the element's row reads
+  // "name / comment" and the comment gets no row of its own. Ten identical
+  // <Section> rows are otherwise indistinguishable, and the note above each is
+  // the only thing telling them apart.
+  const noteFor = new Map(); // index of the annotated node -> comment node
+  const folded = new Set(); // indices that render as part of the row below
+  nodes.forEach((n, i) => {
+    if (n.kind !== 'comment') return;
+    const next = nodes[i + 1];
+    if (next && ANNOTATABLE.has(next.kind)) {
+      noteFor.set(i + 1, n);
+      folded.add(i);
+    }
+  });
+
   return (
     <>
-      {nodes.map((node, i) => (
-        <React.Fragment key={node.id}>
-          <Gap parentId={parentId} index={i} depth={depth} {...ctx} />
-          <TreeNode node={node} parentId={parentId} index={i} depth={depth} {...ctx} />
-        </React.Fragment>
-      ))}
+      {nodes.map((node, i) =>
+        folded.has(i) ? null : (
+          <React.Fragment key={node.id}>
+            {/* Insert above the note, not between it and its element — the two
+                read as one row, so a drop "above" has to clear both. */}
+            <Gap
+              parentId={parentId}
+              index={noteFor.has(i) ? i - 1 : i}
+              depth={depth}
+              {...ctx}
+            />
+            <TreeNode
+              node={node}
+              note={noteFor.get(i) || null}
+              parentId={parentId}
+              index={i}
+              depth={depth}
+              {...ctx}
+            />
+          </React.Fragment>
+        )
+      )}
       {nodes.length > 0 && <Gap parentId={parentId} index={nodes.length} depth={depth} {...ctx} />}
     </>
   );
@@ -445,7 +510,7 @@ function Gap({ parentId, index, depth, dropTarget, setDropTarget, isDndPayload, 
   );
 }
 
-function TreeNode({ node, parentId, index, depth, ...ctx }) {
+function TreeNode({ node, note, parentId, index, depth, ...ctx }) {
   const {
     selectedId,
     currentLayoutName,
@@ -470,22 +535,46 @@ function TreeNode({ node, parentId, index, depth, ...ctx }) {
     if (isSelected) rowRef.current?.scrollIntoView({ block: 'nearest' });
   }, [isSelected]);
 
-  const hasChildren = Array.isArray(node.children) && node.children.length > 0;
+  // Reported by the page: this node's markers wrap nothing.
+  const rendersNothing = !!ctx.emptyNodeIds?.has(node.id);
+  // Also reported by the page, and different from the above: these DID render.
+  // `display: none` is there and not drawn; `pointer-events: none` is drawn and
+  // takes no clicks. Neither is readable from the source — the rule can come
+  // from any stylesheet — so the row says it.
+  const hidden = !!ctx.hiddenNodeIds?.has(node.id);
+  const inert = !!ctx.inertNodeIds?.has(node.id);
+  // An `if` shows what is inside its then directly — see branches.js. `host` is
+  // the node those children really belong to, which is what a drop has to name.
+  const kids = rowChildren(node);
+  const host = rowHost(node);
+  const hasChildren = kids.length > 0;
   // Pure text (plus simple {expr} interpolations) is edited via the Content
-  // field — showing those as rows is noise until real tags are involved.
-  const showChildren = hasChildren && !node.children.every(isContentOnlyChild);
+  // field — showing those as rows is noise until real tags are involved. Only
+  // where there is such a field, though: see hidesChildRows.
+  const showChildren = hasChildren && !hidesChildRows(node, kids);
   const canHostChildren =
     node.kind === 'component' ||
     node.kind === 'element' ||
     node.kind === 'chunk-group' ||
-    node.kind === 'map';
+    node.kind === 'map' ||
+    // A condition holds nothing directly; each of its branches does — and the
+    // `if` row stands in for the then, whose row is never drawn.
+    node.kind === 'branch' ||
+    !!thenBranch(node);
   const nodeCollapsed = isCollapsed(node);
   const isDropInto = dropTarget?.intoId === node.id;
 
-  let { icon, label } = describeNode(node);
+  let { icon, label } = describeNode(node, ctx.liveClassesById?.get(node.id));
+  // The layout wrapper is the one node whose row named something the markup
+  // doesn't: a page that does `import Layout from '…/BaseLayout.astro'` writes
+  // `<Layout>`, and showing "BaseLayout" made the tree disagree with the file.
+  // The name it was imported under leads, like every other row; the layout it
+  // resolves to rides along on the right, since that's the part worth knowing.
+  let hint = null;
   if (isLayoutNode) {
     icon = <LayoutIcon size={13} />;
-    label = currentLayoutName || node.name;
+    label = node.name || currentLayoutName;
+    if (currentLayoutName && currentLayoutName !== label) hint = currentLayoutName;
   }
 
   return (
@@ -493,12 +582,14 @@ function TreeNode({ node, parentId, index, depth, ...ctx }) {
       <div
         ref={rowRef}
         data-node-id={node.id}
-        className={`structure-node ${node.kind === 'component' && !node.dynamicTag ? 'is-component' : ''} ${node.kind === 'map' || (isDataBound(node) && !(node.kind === 'component' && !node.dynamicTag)) ? 'is-map' : ''} ${isLayoutNode ? 'layout-node' : ''} ${isSelected ? 'selected' : ''}`}
+        className={`structure-node ${node.kind === 'component' && !node.dynamicTag ? 'is-component' : ''} ${node.kind === 'map' || node.kind === 'cond' || node.kind === 'branch' || (isDataBound(node) && !(node.kind === 'component' && !node.dynamicTag)) ? 'is-map' : ''} ${isLayoutNode ? 'layout-node' : ''} ${isSelected ? 'selected' : ''}`}
         style={{
           paddingLeft: 6 + depth * 16,
           ...(isDropInto ? { borderColor: 'var(--accent)', background: 'var(--accent-soft)' } : {}),
         }}
-        draggable={node.kind !== 'chunk-group'}
+        // A branch is part of its condition's shape, not a node you can move
+        // or drop somewhere else.
+        draggable={node.kind !== 'chunk-group' && node.kind !== 'branch'}
         onDragStart={(e) => {
           e.stopPropagation();
           e.dataTransfer.setData('avb/node', node.id);
@@ -515,10 +606,7 @@ function TreeNode({ node, parentId, index, depth, ...ctx }) {
         }}
         onDrop={(e) => {
           if (canHostChildren && acceptsDrag(node)) {
-            performDrop(e, {
-              parentId: node.id,
-              index: Array.isArray(node.children) ? node.children.length : 0,
-            });
+            performDrop(e, { parentId: host.id, index: kids.length });
           }
         }}
         onClick={(e) => {
@@ -527,7 +615,11 @@ function TreeNode({ node, parentId, index, depth, ...ctx }) {
         }}
         onDoubleClick={(e) => {
           // Drill into a component's own file, the way Webflow opens one.
-          if (node.kind !== 'component' || node.dynamicTag || !onOpenComponent) return;
+          // astro:assets components live in Astro, not the project — there is
+          // no file to open, so a double-click does nothing rather than
+          // hunting for one that can't be found.
+          if (node.kind !== 'component' || node.dynamicTag || node.astroAsset) return;
+          if (!onOpenComponent) return;
           e.stopPropagation();
           onOpenComponent(node.name, node.id);
         }}
@@ -558,35 +650,56 @@ function TreeNode({ node, parentId, index, depth, ...ctx }) {
         <span className="icon">{icon}</span>
         <span className="label" style={node.kind === 'text' ? { fontWeight: 400, fontStyle: 'italic' } : {}}>
           {label}
+          {note && (
+            <span className="node-note" title={note.value.trim()}>
+              {' / '}
+              {truncate(noteText(note.value).replace(/\s+/g, ' '), 44)}
+            </span>
+          )}
         </span>
+        {hint && (
+          <span className="prop-preview" title={`Imported from ${hint}.astro`}>
+            {hint}
+          </span>
+        )}
+        {(rendersNothing || hidden || inert) && (
+          <span className="node-empty">
+            {rendersNothing ? (
+              <span title="Renders nothing on the page with its current props">
+                <HideIcon size={13} />
+              </span>
+            ) : null}
+            {hidden && !rendersNothing ? (
+              <span title="display: none — on the page, not drawn">
+                <HideIcon size={13} />
+              </span>
+            ) : null}
+            {inert ? (
+              <span title="pointer-events: none — drawn, but takes no clicks">
+                <PointerEventsNoneIcon size={13} />
+              </span>
+            ) : null}
+          </span>
+        )}
       </div>
 
       {showChildren && !nodeCollapsed && (
-        <NodeList nodes={node.children} parentId={node.id} depth={depth + 1} {...ctx} />
+        <NodeList nodes={kids} parentId={host.id} depth={depth + 1} {...ctx} />
       )}
     </>
   );
 }
 
-// Children the Content field fully covers: plain text and simple {expr}
-// interpolations (single braces, no JSX). These get no navigator rows.
-function isContentOnlyChild(c) {
-  return (
-    c.kind === 'text' ||
-    (c.kind === 'expr' && /^\{[^{}]*\}$/.test(c.value) && !c.value.includes('<'))
-  );
-}
-
 // Locates a node plus its parent, sibling list, and index — the context the
-// arrow-key navigation needs.
+// arrow-key navigation needs. Walked the way the tree is drawn, so ↑ from
+// inside a lone then reaches the `if` the reader can see rather than the
+// branch row standing behind it.
 function findWithParent(nodes, id, parent) {
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
     if (n.id === id) return { node: n, parent, siblings: nodes, index: i };
-    if (Array.isArray(n.children)) {
-      const found = findWithParent(n.children, id, n);
-      if (found) return found;
-    }
+    const found = findWithParent(rowChildren(n), id, n);
+    if (found) return found;
   }
   return null;
 }
@@ -596,12 +709,12 @@ function findWithParent(nodes, id, parent) {
 // Everything starts collapsed; expanding is always an explicit action
 // (chevron, expand-all, arrow-down navigation, or selection reveal).
 function defaultCollapsed(node) {
-  return Array.isArray(node.children) && node.children.length > 0;
+  return rowChildren(node).length > 0;
 }
 
 // The row's icon already says what kind a node is, so no trailing kind badge
 // ("comment", "loop", …) — it only repeated the icon in words.
-function describeNode(node) {
+function describeNode(node, live) {
   switch (node.kind) {
     case 'text':
       return { icon: <TextIcon size={12} />, label: truncate(node.value, 34) };
@@ -613,12 +726,16 @@ function describeNode(node) {
       return { icon: <CodeIcon size={12} />, label: truncate(node.value, 30) };
     case 'element': {
       // Webflow-style label: the first class name when the element has
-      // classes, the bare tag name otherwise.
-      const cls = node.props?.class;
-      const classes =
-        cls && cls.type === 'string' ? cls.value.trim().split(/\s+/).filter(Boolean) : [];
-      const label = classes.length ? truncate(classes[0], 40) : node.name;
-      return { icon: elementIcon(node.name), label };
+      // classes, the bare tag name otherwise (and a named slot's name — see
+      // elementLabel). Covers `class:list={[...]}`, where the classes live in
+      // an expression rather than a string.
+      const fromSource = elementLabel(node);
+      // A class the source can't resolve — `class:list={["button_wrap", …]}`
+      // or a whole class passed in as a prop — leaves the label as the bare
+      // tag. The page knows what it rendered as, so use that instead.
+      const label =
+        fromSource === node.name && live?.length ? live[0] : fromSource;
+      return { icon: elementIcon(node.name), label: truncate(label, 40) };
     }
     case 'chunk-group':
       return { icon: <FileIcon size={12} />, label: node.name };
@@ -634,11 +751,30 @@ function describeNode(node) {
         label: at > 0 ? node.head.slice(0, at + 4) : truncate(node.head, 24),
       };
     }
+    case 'cond':
+      // The test is what tells one condition from another, so it's the label.
+      return { icon: <BranchIcon size={12} />, label: truncate(`if ${node.test}`, 40) };
+    case 'branch':
+      return {
+        icon: <CornerIcon size={12} />,
+        label: node.name === 'else' ? 'else' : 'then',
+      };
     default:
       // `<Tag>` from `const Tag = tag` is a dynamic element, not a component
       // — no file behind it, so it shouldn't wear the component's colours.
+      // Its name is a variable, so it says nothing about what the row is; the
+      // class it rendered with does, the same as for any other element.
       if (node.dynamicTag) {
-        return { icon: <CustomElementIcon size={12} />, label: node.name };
+        const named = elementLabel(node);
+        return {
+          icon: <CustomElementIcon size={12} />,
+          label: truncate(named === node.name && live?.length ? live[0] : named, 40),
+        };
+      }
+      // astro:assets' <Image>/<Picture> aren't the project's components —
+      // there's no file to open — so they get Astro's mark, not the green cube.
+      if (node.astroAsset) {
+        return { icon: astroAssetIcon(node.name, 14), label: node.name };
       }
       return { icon: <ElementComponentIcon size={14} />, label: node.name };
   }

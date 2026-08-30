@@ -1,6 +1,10 @@
 import React from 'react';
 
 // Minimal stroke-based icon set on a 16px grid, Framer-style.
+// Astro's brand accent, so anything from astro:assets is identifiable at a
+// glance as Astro's rather than the project's or plain HTML's.
+export const ASTRO_ASSET_ACCENT = '#ff5d01';
+
 const I = ({ children, size = 16, className, style, filled = false, strokeWidth = 1.3 }) => (
   <svg
     width={size}
@@ -23,6 +27,13 @@ export const FileIcon = (p) => (
   <I {...p}>
     <path d="M4.5 1.75h4.4l3.1 3.1v9.15a.5.5 0 0 1-.5.5h-7a.5.5 0 0 1-.5-.5V2.25a.5.5 0 0 1 .5-.5Z" />
     <path d="M8.9 1.9v3h3" />
+  </I>
+);
+
+// An easing curve: what the editor behind it edits.
+export const EaseIcon = (p) => (
+  <I {...p}>
+    <path d="M2 13c5.5 0 5-10 12-10" />
   </I>
 );
 
@@ -54,6 +65,13 @@ export const CommentIcon = (p) => (
 export const CodeIcon = (p) => (
   <I {...p}>
     <path d="m5.5 5-3 3 3 3M10.5 5l3 3-3 3" />
+  </I>
+);
+
+export const PencilIcon = (p) => (
+  <I {...p}>
+    <path d="M11.2 2.6a1.3 1.3 0 0 1 1.85 1.85L5.6 11.9l-2.45.6.6-2.45Z" />
+    <path d="m10.1 3.7 2.2 2.2" />
   </I>
 );
 
@@ -137,6 +155,18 @@ export const ElementComponentIcon = (p) => (
   </I>
 );
 
+// Make a component out of what's selected — the component cube with a plus.
+export const ComponentPlusIcon = (p) => (
+  <I {...p} filled>
+    <path
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M7.52148 1.69129C7.81982 1.52868 8.18018 1.52868 8.47852 1.69129L13.4785 4.41883C13.7998 4.59406 14 4.93082 14 5.29676V7.99988H13V5.84168L8.5 8.29676V14.2968L8.47852 14.3085C8.18027 14.471 7.81973 14.471 7.52148 14.3085L2.52148 11.5809C2.20027 11.4057 2.00005 11.0689 2 10.703V5.29676C2 4.93082 2.20022 4.59406 2.52148 4.41883L7.52148 1.69129ZM3 10.703L7.5 13.1571V8.29676L3 5.84168V10.703ZM3.54395 4.99988L8 7.43055L12.4561 4.99988L8 2.56922L3.54395 4.99988Z"
+    />
+    <path d="M13 10.9999H15V11.9999H13V13.9999H12V11.9999H10V10.9999H12V8.99988H13V10.9999Z" />
+  </I>
+);
+
 export const ElementSlotIcon = (p) => (
   <I {...p} filled>
     <path
@@ -186,6 +216,30 @@ export const PreviewIcon = (p) => (
 export const FolderIcon = (p) => (
   <I {...p}>
     <path d="M2 12.5V3.8a.8.8 0 0 1 .8-.8h3.4l1.5 1.8h5.5a.8.8 0 0 1 .8.8v6.9a.8.8 0 0 1-.8.8H2.8a.8.8 0 0 1-.8-.8Z" />
+  </I>
+);
+
+// Webflow's folder glyph — a filled evenodd path, so it opts into `filled`
+// rather than the stroked default the other icons use.
+export const FolderDefaultIcon = (p) => (
+  <I filled {...p}>
+    <path
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M8.70703 5H13C13.5523 5 14 5.44772 14 6V12C14 12.5523 13.5523 13 13 13H3C2.44771 13 2 12.5523 2 12V4C2 3.44772 2.44772 3 3 3H6.70703L8.70703 5ZM3 12H13V8H3V12ZM3 7H13V6H8.29297L6.29297 4H3V7Z"
+    />
+  </I>
+);
+
+// Webflow's CMS glyph — a page Astro generates from a collection entry rather
+// than one someone wrote. Filled evenodd, like the rest of the Webflow set.
+export const CollectionIcon = (p) => (
+  <I filled {...p}>
+    <path
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M4.5752 2.79515C5.47691 2.2942 6.68875 2 8 2C9.31125 2 10.5231 2.2942 11.4248 2.79515C12.3096 3.2867 13 4.04561 13 5V11C13 11.9544 12.3096 12.7133 11.4248 13.2048C10.5231 13.7058 9.31125 14 8 14C6.68875 14 5.47691 13.7058 4.5752 13.2048C3.69042 12.7133 3 11.9544 3 11V5C3 4.04561 3.69042 3.2867 4.5752 2.79515ZM4 9.82287V11C4 11.4263 4.31694 11.9174 5.06084 12.3307C5.7878 12.7346 6.82597 13 8 13C9.17403 13 10.2122 12.7346 10.9392 12.3307C11.6831 11.9174 12 11.4263 12 11V9.82287C11.8227 9.96383 11.6289 10.0915 11.4248 10.2048C10.5231 10.7058 9.31125 11 8 11C6.68875 11 5.47691 10.7058 4.5752 10.2048C4.37109 10.0915 4.17733 9.96383 4 9.82287ZM12 8C12 8.42632 11.6831 8.91741 10.9392 9.33069C10.2122 9.73456 9.17403 10 8 10C6.82597 10 5.7878 9.73456 5.06084 9.33069C4.31694 8.91741 4 8.42632 4 8V6.82287C4.17733 6.96383 4.37109 7.09145 4.5752 7.20485C5.47691 7.7058 6.68875 8 8 8C9.31125 8 10.5231 7.7058 11.4248 7.20485C11.6289 7.09145 11.8227 6.96383 12 6.82287V8ZM10.9392 3.66931C11.6831 4.08259 12 4.57368 12 5C12 5.42632 11.6831 5.91741 10.9392 6.33069C10.2122 6.73456 9.17403 7 8 7C6.82597 7 5.7878 6.73456 5.06084 6.33069C4.31694 5.91741 4 5.42632 4 5C4 4.57368 4.31694 4.08259 5.06084 3.66931C5.7878 3.26544 6.82597 3 8 3C9.17403 3 10.2122 3.26544 10.9392 3.66931Z"
+    />
   </I>
 );
 
@@ -415,9 +469,43 @@ export const DragIcon = (p) => (
   </I>
 );
 
+// Struck-through eye: this node put nothing on the page. Filled paths, so it
+// takes `filled` rather than the stroked default the rest of the set uses.
+export const HideIcon = (p) => (
+  <I {...p} filled>
+    <path
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M10.705 11.4122L13.6465 14.3536L14.3536 13.6465L2.35356 1.64648L1.64645 2.35359L4.3881 5.09524C3.39355 5.76124 2.5932 6.69436 2.08965 7.79152C2.02888 7.92392 2.02888 8.07624 2.08965 8.20865C3.11616 10.4452 5.37598 12 8.00001 12C8.9654 12 9.8815 11.7896 10.705 11.4122ZM9.94073 10.6479L5.11152 5.81865C4.25765 6.3466 3.55888 7.10172 3.09962 8.00007C4.01049 9.78177 5.86347 11 8.00001 11C8.68308 11 9.33716 10.8755 9.94073 10.6479Z"
+    />
+    <path d="M13.9104 8.20856C13.5777 8.93353 13.1154 9.58688 12.5531 10.1389L11.846 9.43184C12.2702 9.01685 12.6276 8.5337 12.9004 8C11.9896 6.21831 10.1366 5.00004 8.00005 5.00004C7.81174 5.00004 7.62562 5.0095 7.44217 5.02798L6.57167 4.15749C7.03127 4.05443 7.50929 4.00004 8.00005 4.00004C10.6241 4.00004 12.8839 5.55491 13.9104 7.79143C13.9712 7.92383 13.9712 8.07616 13.9104 8.20856Z" />
+  </I>
+);
+
+// Struck-through pointer: this node is drawn but takes no clicks
+// (`pointer-events: none`). Filled, like the eye above it.
+export const PointerEventsNoneIcon = (p) => (
+  <I {...p} filled>
+    <path
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M11.5 7.00049C13.9853 7.00049 16 9.01521 16 11.5005C15.9997 13.9855 13.9851 16.0005 11.5 16.0005C9.01488 16.0005 7.00026 13.9855 7 11.5005C7 9.01521 9.01472 7.00049 11.5 7.00049ZM9.4043 14.3032C9.98854 14.7407 10.7139 15.0005 11.5 15.0005C13.4328 15.0005 14.9997 13.4333 15 11.5005C15 10.7143 14.7403 9.9881 14.3027 9.40381L9.4043 14.3032ZM11.5 8.00049C9.567 8.00049 8 9.56749 8 11.5005C8.00011 12.2865 8.25975 13.012 8.69727 13.5962L13.5957 8.69678C13.0115 8.25929 12.2861 8.00049 11.5 8.00049Z"
+    />
+    <path d="M7 5.99951H4.25977L5.71289 9.46045L4.42969 9.99951L2.97168 6.52783L1 8.49951V-0.000488281L7 5.99951Z" />
+  </I>
+);
+
 export const CheckIcon = (p) => (
   <I {...p} strokeWidth={1.6}>
     <path d="m3.5 8.5 3 3 6-7" />
+  </I>
+);
+
+// The "goes here" elbow: one side of a condition, in the navigator.
+export const CornerIcon = (p) => (
+  <I {...p}>
+    <path d="M4.5 3v6.5a1 1 0 0 0 1 1h6" />
+    <path d="m9.3 8.2 2.4 2.3-2.4 2.3" />
   </I>
 );
 
@@ -428,6 +516,30 @@ export const BranchIcon = (p) => (
     <circle cx="11.5" cy="5" r="1.6" />
     <path d="M4.5 5.1v5.8" />
     <path d="M11.5 6.6c0 2.6-3.2 2.8-5.2 3.6" />
+  </I>
+);
+
+// The reverse of BranchIcon: a side branch curving back into the trunk. The
+// arrowhead is what tells the two apart at 12px — without it a merge and a
+// branch are the same three dots and a curve.
+// A clock turned back — the panel is about what the project looked like
+// before, and a plain clock would read as "scheduled".
+export const HistoryIcon = (p) => (
+  <I {...p}>
+    <path d="M2.6 7.2a5.6 5.6 0 1 1 .9 3.9" />
+    <path d="M2.2 4.3v2.9h2.9" />
+    <path d="M8 5.1v3.1l2.2 1.3" />
+  </I>
+);
+
+export const MergeIcon = (p) => (
+  <I {...p}>
+    <circle cx="4.5" cy="3.5" r="1.6" />
+    <circle cx="4.5" cy="12.5" r="1.6" />
+    <circle cx="11.5" cy="3.5" r="1.6" />
+    <path d="M4.5 5.1v5.8" />
+    <path d="M11.5 5.1c0 2.6-2.6 3.4-5.4 4.1" />
+    <path d="M8.2 9.8 6.1 9.2l1.6-1.5" />
   </I>
 );
 
@@ -589,6 +701,15 @@ export const CanvasIcon = (p) => (
   </I>
 );
 
+// Three dots: the row's own menu, shown on hover.
+export const MoreIcon = (p) => (
+  <svg viewBox="0 0 16 16" width={p?.size || 14} height={p?.size || 14} fill="currentColor" aria-hidden="true">
+    <circle cx="3.5" cy="8" r="1.3" />
+    <circle cx="8" cy="8" r="1.3" />
+    <circle cx="12.5" cy="8" r="1.3" />
+  </svg>
+);
+
 export const CopyIcon = (p) => (
   <I {...p}>
     <rect x="5.75" y="5.75" width="8.5" height="8.5" rx="1.5" />
@@ -635,6 +756,34 @@ export const DropletIcon = (p) => (
   <I {...p}>
     <path d="M8 2.2s4 4 4 6.6a4 4 0 0 1-8 0C4 6.2 8 2.2 8 2.2Z" />
   </I>
+);
+
+export const HelpCircleIcon = ({ size = 16, className, style }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 16 16"
+    fill="none"
+    className={className}
+    style={{ display: 'block', flexShrink: 0, ...style }}
+    aria-hidden="true"
+  >
+    <path
+      d="M7.5 4C6.67157 4 6 4.67157 6 5.5V6H7V5.5C7 5.22386 7.22386 5 7.5 5H9.32578C9.75296 5 9.98341 5.50106 9.70541 5.8254L8.36111 7.39374C8.12809 7.6656 8 8.01186 8 8.36992V9H9V8.36992C9 8.25057 9.0427 8.13515 9.12037 8.04453L10.4647 6.47619C11.2987 5.50318 10.6073 4 9.32578 4H7.5Z"
+      fill="currentColor"
+    />
+    <path
+      d="M8.5 11.25C8.91421 11.25 9.25 10.9142 9.25 10.5C9.25 10.0858 8.91421 9.75 8.5 9.75C8.08579 9.75 7.75 10.0858 7.75 10.5C7.75 10.9142 8.08579 11.25 8.5 11.25Z"
+      fill="currentColor"
+    />
+    <path
+      opacity="0.4"
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M8.5 1C12.0899 1 15 3.91015 15 7.5C15 11.0899 12.0899 14 8.5 14C4.91015 14 2 11.0899 2 7.5C2 3.91015 4.91015 1 8.5 1ZM8.5 2C5.46243 2 3 4.46243 3 7.5C3 10.5376 5.46243 13 8.5 13C11.5376 13 14 10.5376 14 7.5C14 4.46243 11.5376 2 8.5 2Z"
+      fill="currentColor"
+    />
+  </svg>
 );
 
 export const GearIcon = (p) => (
@@ -704,6 +853,7 @@ const TAG_ICONS = {
   textarea: ElementInputIcon,
   select: ElementSelectIcon,
   button: ElementButtonIcon,
+  slot: ElementSlotIcon,
 };
 
 export const SearchIcon = (p) => (
@@ -713,7 +863,107 @@ export const SearchIcon = (p) => (
   </I>
 );
 
+export const TerminalIcon = (p) => (
+  <I {...p}>
+    <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5" />
+    <path d="m4.75 6.5 2 1.75-2 1.75M8.5 10.25h3" />
+  </I>
+);
+
+export const ArrowDownIcon = (p) => (
+  <I {...p}>
+    <path d="M8 3v10M4.25 9.25 8 13l3.75-3.75" />
+  </I>
+);
+
 export function elementIcon(tag, size = 12, className) {
   const Icon = TAG_ICONS[String(tag).toLowerCase()] || CustomElementIcon;
   return <Icon size={size} className={className} />;
 }
+
+// astro:assets <Image> / <Picture>. The glyph is the element they render, so
+// the row still reads as an image, tinted with Astro's accent and carrying a
+// small mark — a plain <img> is grey, a project component is green, and this
+// is neither.
+export function astroAssetIcon(name, size = 14, className) {
+  const stack = name === 'Picture';
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden="true"
+      className={className}
+      style={{ display: 'block', flexShrink: 0, color: ASTRO_ASSET_ACCENT }}
+    >
+      {/* A second frame behind the first says "more than one source". */}
+      {stack && (
+        <path
+          d="M4.5 3.5H2.75A.75.75 0 0 0 2 4.25v8a.75.75 0 0 0 .75.75H10"
+          stroke="currentColor"
+          strokeWidth="1.2"
+          strokeLinecap="round"
+          opacity="0.55"
+        />
+      )}
+      <rect
+        x={stack ? 5 : 2.6}
+        y={stack ? 2 : 3}
+        width={stack ? 9 : 10.8}
+        height={stack ? 9 : 10}
+        rx="1.1"
+        stroke="currentColor"
+        strokeWidth="1.2"
+      />
+      <circle cx={stack ? 7.6 : 5.6} cy={stack ? 4.7 : 5.9} r="1" fill="currentColor" />
+      <path
+        d={stack ? 'M5.4 10.2 8.2 7.6l5.2 4.6' : 'M3 12.2l3.4-3.2 6.6 5.5'}
+        stroke="currentColor"
+        strokeWidth="1.2"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+// Boolean prop — a switch, matching the True/False control the field renders.
+export const FieldSwitchIcon = (p) => (
+  <I {...p} filled>
+    <path d="M10 10.5C11.3807 10.5 12.5 9.38071 12.5 8C12.5 6.61929 11.3807 5.5 10 5.5C8.61929 5.5 7.5 6.61929 7.5 8C7.5 9.38071 8.61929 10.5 10 10.5Z" />
+    <path
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M6 3C3.23858 3 1 5.23858 1 8C1 10.7614 3.23858 13 6 13H10C12.7614 13 15 10.7614 15 8C15 5.23858 12.7614 3 10 3H6ZM2 8C2 5.79086 3.79086 4 6 4H10C12.2091 4 14 5.79086 14 8C14 10.2091 12.2091 12 10 12H6C3.79086 12 2 10.2091 2 8Z"
+    />
+  </I>
+);
+
+// Variables — the panel that reads a project's CSS custom properties.
+export const VariableIcon = ({ size = 24, className, style }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    className={className}
+    style={{ display: 'block', flexShrink: 0, ...style }}
+    aria-hidden="true"
+  >
+    <path
+      opacity="0.4"
+      d="M4.57128 13.046C3.67273 13.2423 3 14.0426 3 15V19C3 20.1045 3.89543 21 5 21L12.5252 21L4.57128 13.046Z"
+      fill="currentColor"
+    />
+    <path
+      d="M16 18C16.5523 18 17 17.5523 17 17C17 16.4477 16.5523 16 16 16C15.4477 16 15 16.4477 15 17C15 17.5523 15.4477 18 16 18Z"
+      fill="currentColor"
+    />
+    <path
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M14 3C12.8954 3 12 3.89543 12 5V7.34315L10.7573 6.10044C9.97624 5.31939 8.70991 5.31939 7.92886 6.10043L5.10043 8.92886C4.31939 9.70991 4.31939 10.9762 5.10043 11.7573L12.9999 19.6568V19.6457C13.7329 20.4762 14.8053 21 16 21C18.2091 21 20 19.2091 20 17V5C20 3.89543 19.1046 3 18 3H14ZM18 4H14C13.4477 4 13 4.44772 13 5V17C13 18.6569 14.3431 20 16 20C17.6569 20 19 18.6569 19 17V5C19 4.44772 18.5523 4 18 4ZM10.0502 6.80754L12 8.75736V17C12 17.0841 12.0026 17.1676 12.0077 17.2503L5.80754 11.0502C5.41702 10.6597 5.41702 10.0265 5.80754 9.63597L8.63597 6.80754C9.02649 6.41702 9.65966 6.41702 10.0502 6.80754Z"
+      fill="currentColor"
+    />
+  </svg>
+);

@@ -12,11 +12,19 @@
   --text-faint: #666666;
   --accent: #0099ff;
   --accent-soft: rgba(0, 153, 255, 0.16);
+  /* Selected text, everywhere. A saturated blue rather than the accent, which
+     is too light to carry white text — this one clears 5:1 against white, so a
+     selected value stays as readable as an unselected one. */
+  --selection: #1668e3;
+  --selection-text: #ffffff;
   --green: #30c158;
   /* Components read in this green everywhere: Navigator rows, the canvas
      outline, and the "inside a component" back button. */
   --component-green: #79e09c;
   --component-green-soft: rgba(121, 224, 156, 0.16);
+  /* Pages Astro generates from a collection ([id], [...slug]) read in this
+     purple wherever pages are listed. */
+  --collection-purple: #c4afff;
   --red: #ff453a;
   --amber: #ffd60a;
   --radius: 8px;
@@ -54,7 +62,14 @@ button {
   justify-content: center;
   gap: 6px;
 }
-button:hover:not(:disabled) { background: var(--bg-active); }
+/* Not inside the style panel: that panel styles its own controls, and this
+   rule was quietly winning over them. It is more specific than a panel rule
+   like `.u-select-button:hover` (a type selector's worth more), and it sets the
+   background shorthand — so a dropdown's own opaque colour was thrown away on
+   hover and replaced by a faint white wash over the panel *behind* it, which
+   lands darker than the control. Hovering made things dimmer.
+   `:where()` keeps the exclusion from changing what this rule beats elsewhere. */
+button:hover:not(:disabled):where(:not(.style-panel-host *, .style-panel-surface *)) { background: var(--bg-active); }
 button:disabled { opacity: 0.4; cursor: default; }
 button.primary { background: var(--accent); color: white; font-weight: 600; }
 button.primary:hover:not(:disabled) { background: #24a8ff; }
@@ -74,7 +89,11 @@ input, select, textarea {
   width: 100%;
   transition: border-color 0.1s, background 0.1s;
 }
-input:hover, select:hover, textarea:hover { background: rgba(255, 255, 255, 0.08); }
+/* No hover on a field. A button lights up because pressing it does something;
+   a field just sits there holding a value, and lighting it under the pointer
+   made the panel twitch on the way past. Focus is where a field changes — see
+   below. (This used to paint every input, the style panel's included, which is
+   why the panel's fields flickered on the way to a control.) */
 input:focus, select:focus, textarea:focus {
   border-color: var(--accent);
   background: var(--bg-input);
@@ -82,6 +101,24 @@ input:focus, select:focus, textarea:focus {
 input[type='checkbox'] {
   width: auto;
   accent-color: var(--accent);
+}
+
+/* Focus, in this app's colour.
+   Left to the browser, the ring is drawn in whatever Chromium takes from the
+   system — which is not this interface's blue, and here came out orange on
+   every row, button and field that took focus. Replaced rather than removed:
+   the ring is how anyone working from the keyboard knows where they are, and a
+   window with no focus indicator is a window you can get lost in. Controls that
+   draw their own ring (the style panel's fields, which use an inset shadow so
+   the ring hugs the control) still do — they set `outline: none` themselves and
+   are more specific than this. */
+/* …except a field, which already says it: `input:focus` above turns its border the
+   same accent and darkens its fill. An outline on top of that is a second ring
+   around the first, which is what the attribute editor's value box was drawing.
+   `:where()` keeps this at the same weight, so anything that opts out still wins. */
+:focus-visible:where(:not(input):not(textarea):not(select)) {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none; }
 
@@ -206,6 +243,13 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
 .page-menu-item.highlight { background: var(--bg-active); color: var(--text); }
 .page-menu-item.current { color: var(--text); }
 .page-menu-item.current svg:last-child { color: var(--accent); }
+/* A generated route ([id], [...slug]) — same purple as the Pages panel.
+   Both selectors beat `.page-menu-item svg` / `.page-switch-btn svg:first-child`
+   on specificity, and neither touches the check on the current row. */
+.page-menu-item.collection > svg:first-child,
+.page-menu-item.collection .page-menu-name,
+.page-switch-btn.collection > svg:first-child,
+.page-switch-btn.collection .page-switch-label { color: var(--collection-purple); }
 .page-menu-name {
   font-weight: 500;
   overflow: hidden;
@@ -258,6 +302,219 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
   display: block;
 }
 
+/* A question, asked in the app's own window rather than the browser's.
+   Narrow, because a confirm that needs a wide window is a confirm asking too
+   much at once. */
+.confirm-dialog { width: 380px; max-width: 90vw; }
+.confirm-body { font-size: 12px; line-height: 1.55; color: var(--text-dim); white-space: pre-line; }
+.confirm-body strong { color: var(--text); font-weight: 600; }
+/* A decision that belongs with the question rather than after it. */
+.confirm-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  cursor: pointer;
+  color: var(--text);
+}
+.confirm-check input { margin: 1px 0 0; flex-shrink: 0; }
+.confirm-check-hint { display: block; margin-top: 2px; color: var(--text-faint); font-style: normal; font-size: 11px; }
+/* Destructive confirms are red and do NOT answer to Return — the button has to
+   be chosen on purpose. */
+.modal-footer button.danger {
+  background: var(--red);
+  border-color: var(--red);
+  color: #fff;
+}
+.modal-footer button.danger:hover { filter: brightness(1.08); }
+
+/* A merge that touched twenty files is not twenty things to read at once:
+   the files down the side, one of them open at a time. */
+.conflict-modal { width: 880px; max-width: 94vw; display: flex; flex-direction: column; }
+.conflict-intro { padding: 0 16px 10px; }
+.conflict-split { display: grid; grid-template-columns: 220px 1fr; min-height: 0; flex: 1; }
+.conflict-files {
+  border-right: 1px solid var(--border);
+  border-top: 1px solid var(--border);
+  overflow-y: auto;
+  max-height: 460px;
+  padding: 6px;
+}
+.conflict-file-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: 'name badge' 'dir badge';
+  gap: 0 8px;
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+}
+.conflict-file-row:hover { background: var(--bg-hover); }
+.conflict-file-row.on { background: var(--accent-soft); }
+.conflict-file-name {
+  grid-area: name;
+  font-size: 11.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conflict-file-dir {
+  grid-area: dir;
+  font-size: 10px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+/* "sorted" is the common state and stays quiet; anything still wanting a
+   decision is the only thing on this list worth the eye. */
+.conflict-file-badge {
+  grid-area: badge;
+  align-self: center;
+  font-size: 9.5px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--text-faint);
+  background: var(--surface-2, rgba(255, 255, 255, 0.06));
+  white-space: nowrap;
+}
+.conflict-file-badge.warn { color: #fff; background: var(--accent); }
+
+.conflict-detail {
+  overflow-y: auto;
+  max-height: 460px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}
+.conflict-detail-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 8px;
+}
+.conflict-detail-path {
+  flex: 1;
+  font-size: 11px;
+  font-family: var(--mono, ui-monospace, monospace);
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+/* A line either side, so a difference can be placed in the file without the
+   whole file being on screen. */
+.conflict-ctx {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  opacity: 0.6;
+  padding: 1px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conflict-whole { padding: 10px 4px; font-size: 11.5px; color: var(--text-faint); }
+
+/* Two or three buttons rather than a toggle: which side is chosen has to be
+   readable at a glance down a column of differences, and a switch only shows
+   its state by position. */
+.conflict-choice { display: flex; gap: 2px; flex-shrink: 0; }
+.conflict-choice button {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 5px;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+.conflict-choice button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* One difference. */
+.conflict-hunk { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
+.conflict-hunk-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.conflict-hunk-n {
+  flex: 1;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* Both versions side by side. The kept one is lit; the other stays legible
+   rather than hidden, so the choice can be checked without changing it. */
+.conflict-sides { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.conflict-side {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  opacity: 0.5;
+  transition: opacity 0.12s ease, border-color 0.12s ease;
+}
+.conflict-side.kept { opacity: 1; border-color: var(--accent); }
+.conflict-side-label {
+  padding: 3px 7px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-faint);
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conflict-side.kept .conflict-side-label { color: var(--accent); }
+.conflict-side .code-block { background: var(--bg); }
+.conflict-empty { padding: 8px; font-size: 11px; color: var(--text-faint); font-style: italic; }
+
+/* Code shown rather than edited — the editor's own type and colours, with
+   nothing that invites a cursor. */
+.code-block { font-size: 11px; }
+.code-block .cm-editor { background: transparent; }
+.code-block .cm-content { padding: 6px 8px; }
+.code-block .cm-line { padding: 0; }
+.conflict-hunk.combined .conflict-hunk-n { color: var(--green); }
+
+/* An old version, covering the canvas. Laid out as a column so the banner is
+   part of the overlay rather than floating over the page — a bar that overlaps
+   the site being looked at is a bar that hides the thing you came to see. */
+.preview-mode.old-version { display: flex; flex-direction: column; background: var(--bg); }
+.preview-mode.old-version iframe { flex: 1; min-height: 0; background: white; }
+
+.preview-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.preview-banner-text { flex: 1; line-height: 1.4; }
+.preview-banner-text strong { font-weight: 600; }
+.preview-banner-exit {
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 500;
+  padding: 4px 10px;
+}
+.preview-banner-exit:hover { background: rgba(255, 255, 255, 0.28); }
+
 /* Link settings (href fields) */
 .link-types {
   position: relative;
@@ -276,20 +533,26 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
   background: transparent;
   border-radius: 6px;
   color: var(--text-faint);
+  transition: color 0.18s ease;
 }
-/* Only unselected buttons take a hover fill — the sliding indicator owns
-   the active button's background. */
+/* Hovering only lifts the icon — a fill would read as a second selection
+   while the chip is still travelling to where you clicked. */
 .link-types button:hover:not(:disabled):not(.on) {
   color: var(--text);
-  background: var(--bg-hover);
+  background: transparent;
 }
 .link-types button.on { background: transparent; color: var(--text); }
+/* Same chip as the True/False switcher: a flat tint this close to the track
+   disappears, so it carries a drop shadow and a hairline to lift off it. */
 .link-types-indicator {
   position: absolute;
   top: 2px;
   bottom: 2px;
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.16);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.45),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.06);
   transition:
     left 0.25s cubic-bezier(0.3, 0.7, 0.3, 1),
     width 0.25s cubic-bezier(0.3, 0.7, 0.3, 1);
@@ -351,6 +614,121 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
 .attr-row:hover .row-action { opacity: 1; }
 .attr-row .row-action:hover { color: var(--red); background: var(--bg-active); }
 
+/* A prop that takes a list of words, edited as a list of words. Built from the
+   attribute rows above — same height, same hover, same quiet row action — since
+   both are a list of little things inside one field. */
+.list-field {
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-top: 2px;
+}
+.list-field-empty {
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.list-field-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 30px;
+  padding: 0 6px 0 4px;
+  font-size: 12px;
+  min-width: 0;
+  /* The line a drop would land on is drawn on the row itself, so a list that
+     scrolls cannot leave one behind. */
+  box-shadow: none;
+}
+.list-field-row + .list-field-row { border-top: 1px solid var(--border); }
+.list-field-row:hover { background: var(--bg-hover); }
+.list-field-row.is-dragging { opacity: 0.4; }
+.list-field-row.is-before { box-shadow: inset 0 1px 0 0 var(--accent); }
+.list-field-row.is-after { box-shadow: inset 0 -1px 0 0 var(--accent); }
+.list-field-grip {
+  display: flex;
+  color: var(--text-faint);
+  opacity: 0;
+  cursor: grab;
+  flex-shrink: 0;
+}
+.list-field-row:hover .list-field-grip { opacity: 1; }
+/* A button, so `justify-content: center` and the filled background come with
+   it from the base rule — neither of which a row of text wants. The row draws
+   its own hover; a second one inside it reads as a control inside a control. */
+.list-field-text {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: 0;
+  padding: 0 4px;
+  height: 100%;
+  justify-content: flex-start;
+  text-align: left;
+  color: var(--text);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: block;
+  line-height: 30px;
+}
+/* Written through the row so it outweighs the base `button:hover` — which is a
+   type selector plus two pseudo-classes, and beats a lone class. Without that,
+   hovering a row filled the label with the pressed-button colour: a pill inside
+   the row, offset from it, reading as a control inside a control. */
+.list-field-row .list-field-text:hover { background: none; }
+.list-field-blank { color: var(--text-faint); }
+.list-field-row.is-open { background: var(--bg-hover); }
+
+/* One item's fields, in the same box the attribute editor uses. */
+.list-item-editor { padding-bottom: 8px; }
+.list-item-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.list-item-field > span {
+  width: 74px;
+  flex-shrink: 0;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.list-item-field > input { flex: 1; min-width: 0; }
+.list-field-remove {
+  opacity: 0;
+  padding: 3px;
+  color: var(--text-faint);
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.list-field-row:hover .list-field-remove { opacity: 1; }
+.list-field-remove:hover { color: var(--red); background: var(--bg-active); }
+/* A button, so it arrives centred from the base rule — which reads as a
+   caption under the list rather than the next row of it. It is the row after
+   the last one, and rows start at the left. */
+.list-field-add {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  width: 100%;
+  height: 30px;
+  padding: 0 10px;
+  background: none;
+  border: 0;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: left;
+}
+.list-field-row:first-child + .list-field-add,
+.list-field-empty + .list-field-add { border-top: 1px solid var(--border); }
+.list-field-add:hover { background: var(--bg-hover); color: var(--text); }
+
 .attr-editor {
   position: fixed;
   z-index: 450;
@@ -383,10 +761,64 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
   font-size: 11.5px;
   color: var(--text-dim);
 }
-/* Tall fields (the CSS editor, the asset card) keep the label and the asset
-   toggle at the top instead of centred against their whole height. */
-.attr-editor-row.top { align-items: flex-start; }
-.attr-editor-row.top > span { padding-top: 6px; }
+/* The value field takes the rest of the row. It used to be a bare <input>, which
+   filled it through the global `input { width: 100% }`; the binding field is a flex
+   row of its own and would otherwise shrink to its content. */
+.attr-editor-row > .prop-expr-row,
+.attr-editor-row > .cm-editor,
+.attr-value-field > .prop-expr-row,
+.attr-value-field > .cm-editor {
+  flex: 1;
+  min-width: 0;
+}
+/* The value field, and the dot that belongs to it — centred on the field's top-left
+   corner, the way a prop field's is. The padding is what lets it sit there: the dot
+   has to stay inside the box whose hover reveals it (reach for one hanging outside
+   and the pointer leaves that box, which hides it, which brings it back — a dot that
+   flickers), and the matching negative margin leaves the field itself where it was. */
+.attr-value-field {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  padding: 9px 0 0 9px;
+  margin: -9px 0 0 -9px;
+}
+/* Anchored by its centre and grown with a transform, so hovering it SCALES rather
+   than moving it: the shared rule resizes the box and shifts left/bottom to keep it
+   centred, which against this corner reads as the dot jumping away from the pointer. */
+.attr-value-field > .bind-handle,
+.attr-value-field > .bind-handle:hover:not(:disabled),
+.attr-value-field > .bind-handle.on {
+  top: 9px;
+  left: 9px;
+  bottom: auto;
+  width: 12px;
+  height: 12px;
+  transform: translate(-50%, -50%);
+  transform-origin: center;
+  transition: transform 0.1s ease, opacity 0.12s ease;
+}
+.attr-value-field > .bind-handle:hover:not(:disabled),
+.attr-value-field > .bind-handle.on {
+  transform: translate(-50%, -50%) scale(1.5);
+}
+.attr-value-field:hover > .bind-handle,
+.attr-value-field > .bind-handle.on { opacity: 1; pointer-events: auto; }
+
+/* Tall fields (the CSS editor, the asset card, a multi-line expression) keep the
+   label and the asset toggle at the top instead of centred against their whole
+   height: both belong to where the value STARTS, and a switch parked halfway down
+   a six-line array reads as belonging to the line beside it. `:has` catches the
+   code editor, which grows with the value rather than being tall by type. */
+.attr-editor-row.top,
+.attr-editor-row:has(.cm-editor) {
+  align-items: flex-start;
+}
+.attr-editor-row.top > span,
+.attr-editor-row:has(.cm-editor) > span {
+  padding-top: 6px;
+}
+.attr-editor-row > .attr-asset-toggle { align-self: flex-start; }
 
 /* Always present, never in the way: switches the value to the file picker. */
 .attr-asset-toggle {
@@ -413,6 +845,10 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
 .style-editor:focus-within { border-color: var(--accent); }
 .style-editor .cm-content { padding: 6px 8px; }
 .style-editor .cm-line { padding: 0; }
+/* The placeholder should read like an input's, not like code. */
+.style-editor .cm-placeholder { color: var(--text-faint); font-family: var(--font); }
+/* As a field of its own (inline styles, under class) it's a block, not a row. */
+.props-field > .style-editor { width: 100%; }
 
 /* Highlighted JS in an input's clothing (loop data, code preview). */
 .expr-input {
@@ -433,6 +869,52 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
 .expr-input .cm-editor { background: transparent; }
 /* The placeholder should read like an input's, not like code. */
 .expr-input .cm-placeholder { color: var(--text-faint); font-family: var(--font); }
+
+/* An expression prop value: the code field, with the "edit its source"
+   pencil tucked beside it. */
+.prop-expr-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 2px;
+}
+.prop-expr-row .expr-input,
+.prop-expr-row .dd-trigger {
+  flex: 1;
+  min-width: 0;
+}
+/* Against a single-line control the pencil centres rather than hugging the
+   top the way it does beside a code field that can grow. */
+.prop-expr-row:has(> .dd-trigger) { align-items: center; }
+
+/* The declaration behind a bound prop, opened in place. */
+.var-src {
+  padding: 8px;
+  gap: 6px;
+}
+.var-src-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.var-src-head .var-src-name {
+  font-family: var(--mono);
+  color: var(--text);
+}
+.var-src-head .ghost { padding: 2px; }
+.var-src-code {
+  max-height: 260px;
+  border: 1px solid var(--border);
+}
+/* A value long enough to want this box is also long enough to run past its edge:
+   the code scrolls inside it — both ways — rather than wrapping (which throws away
+   the indentation) or growing the box off the window. */
+.var-src .var-src-code .cm-scroller {
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.var-src .var-src-code .cm-content { max-width: none; }
 
 /* Insert palette (⌘F / ⌘E) */
 .insert-overlay {
@@ -628,6 +1110,38 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
   pointer-events: none;
 }
 .asset-tile:hover .asset-badge { opacity: 0; }
+/* A folded-in HTML comment beside a node's name in the navigator. */
+/* White, thinned — not a grey. A folded comment sits on whatever row it belongs
+   to, and a component's row is green: #666 against the panel is 3.1:1 and
+   against the selected green row only 2.1:1, because a flat grey can't lift
+   with the background under it. White at 45% composites over each of them and
+   holds ~4.5:1 and ~3.8:1, staying a note rather than a label either way. */
+.node-note {
+  color: rgba(255, 255, 255, 0.45);
+  font-weight: 400;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A node that renders nothing: the label keeps its colour (it's a real node
+   in the file, not disabled) and the struck-through eye rides the right edge,
+   the way a hidden layer reads. */
+/* The markers at the end of a navigator row: renders nothing, display:none,
+   pointer-events:none. More than one can be true at once (a hidden element that
+   is also inert), so they sit in a row with a gap rather than one slot. */
+.node-empty {
+  margin-left: auto;
+  padding-left: 6px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+.node-empty > span { display: flex; align-items: center; }
+.structure-node.selected .node-empty { color: var(--text-dim); }
+
 .asset-ext {
   display: flex;
   flex-direction: column;
@@ -664,6 +1178,15 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
 
 /* Asset field (src/poster props) */
 .asset-field { position: relative; }
+/* The Asset/URL switch belongs in the field's label row. Anchored to the field
+   itself it had to be lifted out with a negative offset, which the panel body
+   (a scroll box) clipped whenever the field was the first one in the panel —
+   exactly where a component's `src` prop usually is. Anchor it to the whole
+   props-field instead, so the label row it sits in is inside the box. */
+.props-field:has(> .asset-field) { position: relative; }
+.props-field:has(> .asset-field) > label { min-height: 20px; display: flex; align-items: center; }
+.props-field > .asset-field { position: static; }
+.props-field > .asset-field > .af-mode { top: 0; right: 0; }
 .af-mode {
   position: absolute;
   top: -24px;
@@ -719,6 +1242,9 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
   white-space: nowrap;
 }
 .af-sub { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+/* A hosted image previews above the URL box rather than replacing it — the
+   URL stays editable while you can see what it points at. */
+.asset-field .af-card + input { margin-top: 8px; }
 .af-choose {
   width: 100%;
   margin-top: 8px;
@@ -922,12 +1448,19 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
   letter-spacing: 0.01em;
 }
 .panel-header button { padding: 3px; }
+/* Wraps a header button so a hover still registers when it's disabled (a
+   disabled button swallows pointer events, tooltip and all). */
+.tip-anchor { display: inline-flex; }
 
 .panel-body {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   overflow-x: auto;
+  /* The 8px scrollbar takes layout space, so a panel whose content crosses
+     the fold used to jog sideways as it appeared and vanished — worst while
+     typing in a field that grows. The gutter is always there instead. */
+  scrollbar-gutter: stable;
   padding: 2px 8px 12px;
 }
 
@@ -972,6 +1505,13 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
 }
 .list-item:hover .row-action { opacity: 1; }
 .list-item .row-action:hover { color: var(--red); background: var(--bg-hover); }
+
+/* A generated route, not an authored page — see isCollectionRoute. Stated for
+   hover and active too, which otherwise recolour the row. */
+.list-item.collection .icon,
+.list-item.collection:hover .icon,
+.list-item.collection.active .icon,
+.list-item.collection .label { color: var(--collection-purple); }
 
 /* Pages tree */
 .list-item.folder .icon { color: var(--text-dim); }
@@ -1026,14 +1566,46 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   width: 100%;
   max-width: 100%;
 }
+/* A popup opened from somewhere OTHER than the style panel (the variables
+   sheet passes its own box — see the `frame` prop) can't live in the style
+   panel's coordinates: its box is in window ones, and measured against a
+   backdrop pinned to the panel it landed off the right of the screen, taking
+   the app's layout with it. Framed popups get the whole window to sit in, and
+   place themselves inside it. */
+body > .embed-editor_bg-modal-backdrop.is-framed {
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: auto;
+  height: auto;
+}
+body > .embed-editor_bg-modal-backdrop.is-framed > .embed-editor_ease-modal {
+  width: auto;
+  max-width: none;
+}
+/* The provenance card sizes to its content (up to 320px in moden, wider than
+   this panel) — cap it at the panel too. Its left edge is clamped to the panel
+   in ProvenancePopover. */
+body > .embed-editor_provenance {
+  max-width: var(--style-panel-width, 320px);
+}
 
 /* The panel is moden's markup, styled by moden's CSS — which assumes moden's
    reset, where a button is an unstyled box. This app styles bare <button> and
    <input> globally (centred inline-flex, filled, rounded, full-width inputs),
    and those opinions land on every control inside the panel: section titles
    come out centred, spacing values grow pill backgrounds. Re-apply the reset
-   the panel was written against, scoped to it, so its own CSS governs. */
-:where(.style-panel-host) button {
+   the panel was written against, scoped to it, so its own CSS governs.
+
+   `.style-panel-surface` is the same scope for the parts of the panel that are
+   NOT inside the host: every popover and modal it opens portals to <body> to
+   escape clipping, and lands outside `.style-panel-host` — where this reset
+   stops and the global rules start again. That is exactly what happened to the
+   grid settings modal: its track rows centred their own labels, and hovering a
+   row painted a pill around the inner button instead of the row. Same defect
+   the comment above describes, one portal away from the fix. */
+:where(.style-panel-host, .style-panel-surface) button {
   /* moden’s reset … */
   font: inherit;
   color: inherit;
@@ -1053,9 +1625,9 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   border-radius: 0;
   transition: none;
 }
-:where(.style-panel-host) input,
-:where(.style-panel-host) textarea,
-:where(.style-panel-host) select {
+:where(.style-panel-host, .style-panel-surface) input,
+:where(.style-panel-host, .style-panel-surface) textarea,
+:where(.style-panel-host, .style-panel-surface) select {
   font: inherit;
   color: inherit;
   width: auto;
@@ -1065,8 +1637,8 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   padding: 0;
   transition: none;
 }
-:where(.style-panel-host) img,
-:where(.style-panel-host) svg { display: block; max-width: 100%; }
+:where(.style-panel-host, .style-panel-surface) img,
+:where(.style-panel-host, .style-panel-surface) svg { display: block; max-width: 100%; }
 
 /* The style panel expects the shell around it to supply padding and to be the
    single scroll container — its own root sets neither (see .app_body in moden).
@@ -1079,6 +1651,13 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
    internal — panel vs app order is then decided here, in app terms. Its
    popovers are unaffected: every one of them portals to <body>. */
 .style-panel-host { flex: 1; min-height: 0; display: flex; flex-direction: column; isolation: isolate; }
+/* While a popup is open the panel under it doesn't scroll: a menu or a colour
+   picker is positioned against its anchor at the moment it opens, so scrolling
+   the field out from under it leaves the two in different places. The gutter
+   below is `stable`, so losing the scrollbar costs no layout — the panel simply
+   stops moving. A popup with a list of its own still scrolls, since the pointer
+   is over it rather than over this. */
+.style-panel-host.is-locked > * { overflow-y: hidden; }
 .style-panel-host > * {
   flex: 1;
   min-width: 0;
@@ -1086,6 +1665,10 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   padding: var(--space-5, 16px);
   overflow-x: clip;
   overflow-y: auto;
+  /* Same gutter as the Settings tab: opening a section pushes past the fold,
+     and without this the whole tab jogs sideways when the bar appears — and
+     again when switching tabs, since the two would disagree by 8px. */
+  scrollbar-gutter: stable;
 }
 
 /* Props / Style switch at the top of the right panel. */
@@ -1148,6 +1731,216 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
 .expr-menu .dd-option:hover .dd-hint { color: rgba(255, 255, 255, 0.8); }
 .expr-menu .dd-option:hover .dd-check { color: white; }
 .expr-menu .dd-check { color: var(--accent); }
+
+/* A prop's value as a field you type in, with the data in it shown as chips.
+   Sized and coloured as an input because that is what it is — the chips are
+   the same purple the content editor gives an {expression}, so "this comes
+   from data" reads the same wherever it appears. */
+.bind-row { align-items: center; }
+.bind-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 30px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  /* Typed spaces are part of the value — one on either side of a chip is the
+     difference between "Posted today" and "Postedtoday". */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  cursor: text;
+  transition: border-color 0.1s, background 0.1s;
+}
+.bind-input:hover { background: rgba(255, 255, 255, 0.08); }
+.bind-input:focus { outline: none; border-color: var(--accent); background: var(--bg-input); }
+.bind-input:empty::before {
+  content: attr(data-placeholder);
+  color: var(--text-faint);
+  pointer-events: none;
+}
+.bind-input .expr-chip { font-size: 11px; padding: 1px 5px; }
+
+/* The data behind the page, as something to look through. Every row is a
+   value in scope with what it currently holds beside it — picking what a prop
+   is bound to becomes reading real content instead of recalling a path. */
+.bind-menu { padding: 0; overflow: hidden; }
+.data-picker { display: flex; flex-direction: column; max-height: 340px; }
+
+/* Which entry the values below come from, and the way to the next one. */
+.dp-entry {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 6px 5px 4px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.dp-entry-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.dp-entry-count {
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.dp-step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-dim);
+}
+.dp-step:hover:not(:disabled) { background: var(--bg-active); color: var(--text); }
+
+.dp-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+.dp-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  padding: 0;
+  height: auto;
+  font-size: 12px;
+  color: var(--text);
+}
+.dp-search input:focus { border: none; box-shadow: none; background: transparent; }
+
+.dp-list { overflow-y: auto; padding: 4px; }
+.dp-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+.dp-row:hover { background: var(--accent); color: white; }
+/* What the field is bound to now: the row is lit in the same purple as the
+   chip that opened the picker, so the connection between the two is visible
+   rather than something to work out. */
+.dp-row.selected {
+  background: rgba(146, 116, 255, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(146, 116, 255, 0.4);
+}
+.dp-row.selected .dp-key { color: var(--collection-purple); }
+.dp-row.selected:hover { background: var(--accent); box-shadow: none; }
+.dp-row:hover .dp-key,
+.dp-row:hover .dp-val,
+.dp-row:hover .dp-twist { color: white; }
+.dp-key {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dp-check { flex-shrink: 0; color: var(--collection-purple); }
+/* What the value IS, down the right — the column you actually read to find
+   the field you mean. Dim, and the first thing to give up space. */
+.dp-val {
+  margin-left: auto;
+  padding-left: 8px;
+  min-width: 0;
+  flex-shrink: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  text-align: right;
+}
+.dp-val.kind { color: var(--text-faint); font-style: italic; }
+/* Bound to, but not present in the entry on the canvas — an optional field
+   nobody filled in. Stepping to another entry often fills it. */
+.dp-row.missing .dp-key { font-style: italic; opacity: 0.85; }
+
+/* Kept so what is under it can be reached, but not itself a choice. */
+.dp-row.path-only .dp-key { color: var(--text-dim); }
+.dp-row.path-only .dp-val { opacity: 0.6; }
+/* The target is the box, not the glyph: a 10px chevron is a 10px thing to hit
+   with a mouse. Padded out to 20x22 and pulled back with negative margins, so
+   it is easy to click without moving the column it sits in — and it stays
+   clear of the key beside it, since a stray hit there would pick the field
+   rather than open it. */
+.dp-twist {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 20px;
+  height: 22px;
+  margin: -4px -2px -4px -4px;
+  border-radius: 4px;
+  color: var(--text-faint);
+}
+.dp-twist > svg { transition: transform 0.12s ease; }
+.dp-twist.hidden { visibility: hidden; }
+.dp-twist.open > svg { transform: rotate(90deg); }
+.dp-row:hover .dp-twist:not(.hidden):hover { background: rgba(255, 255, 255, 0.22); }
+/* Collections the page doesn't read yet — a different kind of thing from what
+   is already in scope, so it says so rather than running on as one list. */
+.dp-section {
+  padding: 8px 8px 4px;
+  margin-top: 2px;
+  border-top: 1px solid var(--border);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.dp-loading {
+  padding: 4px 6px;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-faint);
+}
+.dp-empty {
+  padding: 10px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-faint);
+}
+
+/* The escape hatch to code, for what no path can say. */
+.dp-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.dp-foot:hover { background: var(--bg-hover); color: var(--text); }
 
 /* Loop data source: a purple tag once a source is chosen, matching the
    purple the navigator already uses for loops. Plain while it's None, so an
@@ -1213,6 +2006,100 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   margin-top: 1px;
 }
 
+/* The instance count is a link into the list behind it. A button, so it can be
+   reached by keyboard and can't be dragged along with the row it sits in. */
+.palette-instances {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-decoration: none;
+}
+.palette-instances:hover:not(:disabled) { text-decoration: underline; color: var(--text-dim); }
+.palette-instances:disabled { cursor: default; }
+
+/* Where a component is used — pages and components, each a way in. */
+.instances-popup {
+  position: fixed;
+  z-index: 560;
+  width: 260px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: #1d1d1d;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+  padding-bottom: 4px;
+}
+.instances-head {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 8px 10px 12px;
+  background: #1d1d1d;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.instances-head button { padding: 3px; }
+.instances-group + .instances-group { border-top: 1px solid var(--border); }
+.instances-label {
+  padding: 8px 12px 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-faint);
+}
+.instances-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: calc(100% - 8px);
+  margin: 0 4px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.instances-row:hover { background: var(--bg-hover); }
+.instances-row .icon { display: flex; color: var(--text-faint); flex-shrink: 0; }
+/* A page is somewhere else in the project — coloured the way pages are
+   elsewhere in the app, so the two kinds of row don't have to be read. */
+.instances-row.is-page .icon { color: var(--text-dim); }
+.instances-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.instances-count {
+  flex-shrink: 0;
+  min-width: 18px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--bg-input);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  text-align: center;
+}
+.instances-empty {
+  padding: 4px 12px 8px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+.instances-empty.is-error { color: var(--red); }
+
 /* Component hover preview card */
 .comp-preview {
   position: fixed;
@@ -1268,15 +2155,23 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
 .structure-node.layout-node { color: var(--text-dim); }
 .structure-node .icon { display: flex; align-items: center; color: var(--text-faint); }
 .structure-node:hover .icon { color: var(--text-dim); }
+/* Both the drag grip and — on a node with children — the collapse arrow, and
+   as tall as the row rather than as tall as its 10px icon. The row is 28px of
+   travel; hitting the toggle should not ask for the middle third of it. */
 .structure-node .drag-handle {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 14px;
+  flex-shrink: 0;
+  width: 18px;
+  align-self: stretch;
+  margin: 0 -2px 0 -4px;
+  border-radius: 4px;
   cursor: grab;
   color: var(--text-faint);
   opacity: 0.6;
 }
+.structure-node .drag-handle:hover { opacity: 1; color: var(--text); }
 .structure-node .label {
   flex: 1;
   white-space: nowrap;
@@ -1376,7 +2271,8 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
 .dd-popup {
   position: fixed;
   z-index: 400;
-  max-height: 260px;
+  /* Height comes from the content; the component caps it inline, and only
+     when the window has less room than the list needs. */
   overflow-y: auto;
   background: #232323;
   border: 1px solid var(--border-strong);
@@ -1408,6 +2304,49 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   flex-shrink: 0;
 }
 .dd-option-label { overflow: hidden; text-overflow: ellipsis; }
+.dd-icon { display: flex; align-items: center; flex-shrink: 0; color: var(--text-faint); }
+.dd-option.highlight .dd-icon { color: rgba(255, 255, 255, 0.85); }
+
+/* A popup with a filter box scrolls its list, not itself, so the box stays
+   put while the options move under it. */
+/* Wide enough to read an entry id in: the trigger is a chip in the title bar,
+   and inheriting its width is what cut "2025/the-cost-of-a-thousand-images"
+   down to "2025/the-cost-of-a-tho…". */
+.dd-popup.dd-searchable { display: flex; flex-direction: column; overflow: hidden; padding: 0; min-width: 300px; }
+.dd-search {
+  flex-shrink: 0;
+  height: 30px;
+  margin: 4px 4px 2px;
+  padding: 0 8px;
+  font-size: 12px;
+  background: var(--bg-input);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text);
+}
+.dd-search:focus { outline: none; border-color: var(--accent); }
+.dd-popup.dd-searchable .dd-list { overflow-y: auto; padding: 2px 4px 4px; }
+.dd-empty { padding: 8px; font-size: 11.5px; color: var(--text-faint); }
+
+/* A generated route is purple wherever it appears — the Pages panel, the title
+   bar, and here, where every option is one page a collection makes. */
+.dd-trigger.collection .dd-label,
+.dd-trigger.collection .dd-icon,
+.dd-popup.collection .dd-option-label,
+.dd-popup.collection .dd-icon { color: var(--collection-purple); }
+.dd-popup.collection .dd-option.highlight .dd-option-label,
+.dd-popup.collection .dd-option.highlight .dd-icon { color: white; }
+/* A leading glyph in an option row (the tag switcher's element/component
+   icons), in the same 16px column a check mark would occupy. */
+.dd-option-icon {
+  width: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-dim);
+}
+.dd-option.highlight .dd-option-icon { color: #fff; }
 .dd-option .dd-hint {
   margin-left: auto;
   padding-left: 10px;
@@ -1422,12 +2361,25 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
 /* ------------------------------------------------------------------ */
 
 .props-field { margin: 0 12px 12px; }
-.props-field label {
-  display: block;
+/* The heading over a list (Attributes) — a label in look only: it names the
+   section rather than a field, and labelling nothing keeps its clicks from
+   reaching the button beside it. */
+.props-field label,
+.props-field .props-label-row {
   font-size: 11px;
   font-weight: 500;
   color: var(--text-dim);
   margin-bottom: 5px;
+}
+.props-field label { display: block; }
+/* Its own rule, not the block above: the row holds the + button beside the
+   heading, and as a block the button would hang off the text baseline —
+   sitting visibly high against an 11px label. */
+.props-label-row,
+.props-field .props-label-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
 }
 .props-field label .type-tag {
   font-size: 10px;
@@ -1451,6 +2403,110 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   cursor: pointer;
 }
 .prop-label.set:hover { background: rgba(0, 153, 255, 0.26); }
+
+/* The `{}` beside a prop's name: the switch between the control the field
+   normally shows and a plain expression. It sits quiet — the weight of the `?`
+   next to it — until the field is hovered, and turns purple, the colour a
+   binding is written in, while the expression is the thing on screen. */
+.prop-expr-toggle {
+  display: inline-flex;
+  vertical-align: middle;
+  margin-left: 4px;
+  padding: 2px;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-faint);
+}
+.props-field:hover > label > .prop-expr-toggle { color: var(--text-dim); }
+.prop-expr-toggle:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.prop-expr-toggle.on,
+.props-field:hover > label > .prop-expr-toggle.on {
+  color: #9274ff;
+  background: rgba(146, 116, 255, 0.16);
+}
+.prop-expr-toggle.on:hover:not(:disabled) { background: rgba(146, 116, 255, 0.28); }
+
+/* The way data gets into a field. Nothing until the field is hovered, then a
+   dot on its top-left corner — in the purple a binding is shown in, so what it
+   does is legible before it is read. Hovering the dot grows it into a +, which
+   is the click. Permanent chrome on every field would cost more than it is
+   worth for something most fields never need. */
+.props-field { position: relative; }
+.props-field > label { position: relative; }
+.bind-handle {
+  position: absolute;
+  left: -6px;
+  /* Centred on the control's top-left corner: the label's own bottom margin
+     is 5px, so half a 12px dot below that lands on the corner itself. */
+  bottom: -11px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border-radius: 50%;
+  background: #9274ff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  pointer-events: none;
+  transition: width 0.1s ease, height 0.1s ease, left 0.1s ease, bottom 0.1s ease,
+    opacity 0.12s ease;
+}
+/* Two steps: the field under the pointer shows its own dot, and the dot itself
+   is the target. Lighting every dot in the section at once put a column of
+   purple beside a panel the pointer was only passing through, and said nothing
+   about the field being pointed at. */
+.props-field:hover > label > .bind-handle,
+.bind-handle.on {
+  opacity: 1;
+  pointer-events: auto;
+}
+.bind-handle:hover:not(:disabled),
+.bind-handle.on {
+  background: #9274ff;
+  width: 18px;
+  height: 18px;
+  left: -9px;
+  bottom: -14px;
+}
+.bind-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #fff;
+  transition: opacity 0.1s ease;
+}
+.bind-plus {
+  position: absolute;
+  color: #fff;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+.bind-handle:hover .bind-dot,
+.bind-handle.on .bind-dot { opacity: 0; }
+.bind-handle:hover .bind-plus,
+.bind-handle.on .bind-plus { opacity: 1; }
+
+/* A prop the current source makes moot — an SVG or a public/ file is passed
+   through, so quality, format and the srcset props do nothing. Unset, the
+   field isn't shown at all; this marks the one case that survives, a value
+   already in the markup that the component will ignore. */
+.prop-inert {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 9.5px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: #f0b429;
+  background: rgba(240, 180, 41, 0.14);
+  cursor: help;
+}
 
 /* Popup menu opened by clicking a set prop's label */
 .prop-menu {
@@ -1641,7 +2697,8 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   flex-shrink: 0;
 }
 .props-title .props-title-icon { color: var(--text-dim); }
-.props-title .badge {
+.props-title .badge,
+.cms-collection .badge {
   font-size: 10px;
   padding: 2px 7px;
   border-radius: 99px;
@@ -1649,6 +2706,7 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   color: var(--accent);
   font-weight: 600;
 }
+.cms-collection .badge { flex-shrink: 0; }
 
 /* ------------------------------------------------------------------ */
 /* Preview                                                             */
@@ -1938,6 +2996,15 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
 .git-chip:hover { background: var(--bg-active); color: var(--text); }
 .git-chip .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
 .git-chip .dot.dirty { background: var(--amber); }
+
+/* Why a typed branch name can't be used. Not an error box — nothing has failed
+   yet, and nothing will: the field simply won't act on Enter until it reads. */
+.git-hint {
+  padding: 2px 10px 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--amber);
+}
 /* While an action runs the chip states it, so there's feedback even with the
    dropdown closed (publishing can take a while). */
 .git-chip.busy { color: var(--text); }
@@ -2227,7 +3294,14 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   line-height: 1.6;
   font-size: 12.5px;
 }
-.welcome .actions { display: flex; gap: 10px; margin-top: 16px; }
+.welcome .actions {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+.welcome .actions-row { display: flex; gap: 10px; }
 .welcome .actions button { padding: 9px 18px; font-size: 12.5px; border-radius: 10px; }
 /* On the start screen the primary action reads as white-on-dark rather than
    picking up the app's blue accent. */
@@ -2319,6 +3393,10 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   object-position: top;
   display: block;
 }
+/* A picture being retaken says so with the picture itself, and nothing else —
+   the old one dims until the new one lands. */
+.recent-thumb { position: relative; }
+.recent-thumb.busy img { opacity: 0.5; transition: opacity 0.2s ease; }
 .recent-name {
   font-size: 12px;
   font-weight: 600;
@@ -2439,6 +3517,18 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   margin: 0 -4px;
 }
 .class-suggest { z-index: 500; }
+/* The open tag stays lit while its family menu is up, so it's clear which
+   class the list belongs to when several are on the element. */
+.class-tag.open { box-shadow: 0 0 0 2px var(--bg-input), 0 0 0 3px var(--accent); }
+/* Sized to its longest class rather than to the field: a family menu is a
+   short list of near-identical names, and stretching it to the panel width
+   reads as a different control than the suggestion list. */
+.class-family {
+  z-index: 500;
+  min-width: 120px;
+  max-height: 300px;
+  overflow-y: auto;
+}
 
 /* Component edit mode: a cutout that dims the whole canvas except the
    instance being edited. The huge spread paints everything around the rect;
@@ -2450,6 +3540,45 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.55);
   outline: 1px solid var(--green);
   outline-offset: -1px;
+}
+
+/* Spacing bands — what the style panel's spacing box is pointing at, drawn on
+   the page. Padding is pink and margin blue, the way every builder that draws
+   the box model colours them, so which one is being changed is answered before
+   the number is read. Hatched rather than filled: the content underneath has to
+   stay legible, since the point is to see what the space is doing to it. */
+.spacing-band {
+  position: absolute;
+  z-index: 3;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background-color: color-mix(in srgb, var(--band) 14%, transparent);
+  background-image: repeating-linear-gradient(
+    -45deg,
+    color-mix(in srgb, var(--band) 42%, transparent) 0 1px,
+    transparent 1px 6px
+  );
+  outline: 1px solid color-mix(in srgb, var(--band) 45%, transparent);
+  outline-offset: -1px;
+}
+.spacing-band.is-padding { --band: #ec4899; }
+.spacing-band.is-margin { --band: #3b82f6; }
+/* Gap is a third thing, so it gets a third colour: padding is inside one box,
+   margin is around one box, and gap is between two of them. Sharing a colour
+   with either would say they were the same kind of space. */
+.spacing-band.is-gap { --band: #a855f7; }
+.spacing-band-label {
+  padding: 1px 5px 2px;
+  border-radius: 4px;
+  background: var(--band);
+  color: white;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2528,6 +3657,21 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
 /* ------------------------------------------------------------------ */
 /* CMS — JSON under src/ edited as collections                         */
 /* ------------------------------------------------------------------ */
+
+/* Header of the collections panel: a back arrow and the open group's name,
+   kept together so the "+" stays at the far right. */
+.cms-crumb {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.cms-crumb h2 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cms-crumb button { margin-left: -4px; }
 
 .cms-group + .cms-group { margin-top: 10px; }
 .cms-group-label {
@@ -2619,6 +3763,12 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   white-space: nowrap;
   font-weight: 500;
 }
+/* Reordering: the row being dragged fades, the insertion point is a line. */
+.cms-item.is-dragging,
+.cms-repeat-row.is-dragging,
+.cms-schema-row.is-dragging {
+  opacity: 0.4;
+}
 .cms-item-grip { color: var(--text-faint); opacity: 0; display: flex; cursor: grab; }
 .cms-item:hover .cms-item-grip { opacity: 1; }
 .cms-item svg:last-child { color: var(--text-faint); }
@@ -2651,7 +3801,15 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
 }
 .cms-saved.on { opacity: 1; }
 
-.cms-detail-body { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 24px 60px; }
+/* `--cms-body-inset` is this padding's top, named so a sticky heading inside
+   can cancel it instead of repeating the number. */
+.cms-detail-body {
+  --cms-body-inset: 20px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--cms-body-inset) 24px 60px;
+}
 
 .cms-card {
   max-width: 720px;
@@ -2663,6 +3821,13 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
 .cms-card h3 { font-size: 15px; font-weight: 600; margin-bottom: 14px; }
 
 .cms-field { margin-bottom: 14px; }
+/* Same as the props panel: the Asset/URL switch belongs in the field label
+   row, so it anchors to the whole field rather than being lifted out of the
+   control with an offset the scroll box would clip. */
+.cms-field:has(> .asset-field) { position: relative; }
+.cms-field:has(> .asset-field) > .cms-field-head { min-height: 20px; }
+.cms-field > .asset-field { position: static; }
+.cms-field > .asset-field > .af-mode { top: 0; right: 0; }
 .cms-field-head { display: flex; align-items: center; gap: 4px; margin-bottom: 5px; }
 .cms-field-head label { font-size: 11.5px; color: var(--text-dim); font-weight: 500; }
 .cms-field-remove { opacity: 0; padding: 1px; color: var(--text-faint); }
@@ -2752,6 +3917,7 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
 }
 .cms-repeat-row:hover { color: var(--text); background: var(--bg-hover); }
 .cms-repeat-row.drop-before { border-top-color: var(--accent); }
+.cms-repeat-row.drop-after { border-bottom-color: var(--accent); }
 .cms-repeat-title {
   flex: 1;
   min-width: 0;
@@ -2809,6 +3975,7 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   background: var(--bg-panel-2);
 }
 .cms-schema-row.drop-before { border-top-color: var(--accent); }
+.cms-schema-row.drop-after { border-bottom-color: var(--accent); }
 .cms-schema-grip { color: var(--text-faint); opacity: 0; display: flex; cursor: grab; }
 .cms-schema-row:hover .cms-schema-grip { opacity: 1; }
 .cms-schema-expand {
@@ -2882,3 +4049,1588 @@ body > .embed-editor_bg-modal-backdrop > .embed-editor_grid-modal {
   background: var(--bg-input);
   cursor: pointer;
 }
+
+/* Dynamic-route entry picker in the top bar. A [slug] page has no single URL,
+   so the canvas renders one of getStaticPaths' entries and this says which. */
+.route-picker { display: inline-flex; flex-shrink: 0; max-width: 220px; }
+.route-picker .dd-trigger { height: 22px; padding: 0 6px; font-size: 11px; }
+.route-chip {
+  flex-shrink: 0;
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: var(--bg-input);
+  color: var(--text-faint);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.route-chip.is-error { color: #e6a03c; background: rgba(230, 160, 60, 0.12); }
+
+/* A prop's documentation, from the comment above it in `interface Props`. The
+   "?" sits beside the name; the bubble is fixed so the panel's scroll box
+   can't clip it. */
+.prop-tip-icon {
+  display: inline-flex;
+  vertical-align: middle;
+  margin-left: 5px;
+  color: var(--text-faint);
+  cursor: help;
+  border-radius: 50%;
+  outline: none;
+}
+.prop-tip-icon:hover, .prop-tip-icon:focus-visible { color: var(--text-dim); }
+.prop-tip-icon:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+
+.prop-tip {
+  position: fixed;
+  z-index: 600;
+  transform: translate(-50%, -100%);
+  max-width: 260px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #2e2e2e;
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 400;
+  line-height: 1.45;
+  white-space: normal;
+  pointer-events: none;
+}
+.prop-tip.below { transform: translate(-50%, 0); }
+/* The pointer, on whichever side the bubble ended up. */
+.prop-tip::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  /* Slides with the bubble when it's pushed off an edge, so it keeps
+     pointing at the icon rather than at wherever the bubble landed. */
+  margin-left: calc(-5px + var(--tip-arrow, 0px));
+  border: 5px solid transparent;
+  border-top-color: #2e2e2e;
+  top: 100%;
+}
+.prop-tip.below::after {
+  top: auto;
+  bottom: 100%;
+  border-top-color: transparent;
+  border-bottom-color: #2e2e2e;
+}
+
+/* Boolean prop: True / False segments rather than a checkbox, so the field
+   states which value is in effect instead of leaving "unchecked" to mean both
+   "false" and "not set". The lit half SLIDES between the two, the way the
+   panel tabs do — the movement is what makes it read as one control with a
+   position, rather than two buttons that light up independently. */
+.bool-seg {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  background: var(--bg-input);
+}
+/* Sized to one column and moved by exactly one column + the gap, so no
+   measuring is needed — two equal halves is the only layout this control has. */
+.bool-seg::before {
+  content: '';
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  width: calc(50% - 3px);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.16);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.45),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  transition: transform 0.25s cubic-bezier(0.3, 0.7, 0.3, 1);
+}
+.bool-seg.is-second::before { transform: translateX(calc(100% + 2px)); }
+
+.bool-seg button,
+.bool-seg button:hover:not(:disabled) {
+  position: relative; /* above the sliding chip */
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.18s ease;
+}
+.bool-seg button:hover:not(.on) { color: var(--text); }
+/* An enum's labels are whatever the type says, so they can be long enough to
+   need clipping — True/False never was. */
+.bool-seg button {
+  min-width: 0;
+  padding-inline: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bool-seg button.on,
+.bool-seg button.on:hover:not(:disabled) {
+  color: var(--text);
+  background: transparent; /* the chip behind it is the background */
+}
+
+/* Number prop: app-drawn steppers instead of the browser's. The native ones
+   can't be restyled, ignore the ⇧/⌥ step modifiers, and change the value when
+   the pointer happens to scroll over them. Revealed on hover/focus so a column
+   of numbers stays quiet until you reach for one. */
+.num-field {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.num-field input {
+  width: 100%;
+  padding-right: 20px; /* room for the steppers */
+}
+.num-steppers {
+  position: absolute;
+  right: 3px;
+  top: 3px;
+  bottom: 3px;
+  display: flex;
+  flex-direction: column;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.num-field:hover .num-steppers,
+.num-field:focus-within .num-steppers { opacity: 1; }
+.num-steppers button,
+.num-steppers button:hover:not(:disabled) {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.num-steppers button:hover:not(:disabled) {
+  background: var(--bg-active);
+  color: var(--text);
+}
+.num-steppers button:active { color: var(--accent); }
+
+/* The folded group at the foot of the props panel (class, attributes, the
+   comment, slot) — the fields every node has, kept out of the way of the ones
+   that describe this one. */
+.props-group { margin: 4px 0 0; border-top: 1px solid var(--border); }
+.props-group-head {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: transparent;
+  border-radius: 0;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+/* No hover fill: it's a heading you can click, not a row you pick from — and
+   the app-wide `button:hover` would otherwise light the whole strip. */
+.props-group-head:hover:not(:disabled) { background: transparent; }
+.props-group-head:hover .props-group-chevron { color: var(--text-dim); }
+.props-group-name { flex: 1; text-align: left; }
+.props-group-count {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text-faint);
+  background: var(--bg-input);
+  border-radius: 10px;
+  padding: 1px 6px;
+}
+.props-group-chevron { color: var(--text-faint); transition: transform 0.12s; }
+.props-group.open .props-group-chevron { transform: rotate(90deg); }
+
+/* The URL bar is an input so it can be selected, copied and typed into — but
+   it must still read as the quiet label it was, not a form field, until you
+   reach for it. The app styles inputs globally; this puts the pill back. */
+.titlebar input.url,
+.titlebar input.url:hover {
+  border: 1px solid transparent;
+  text-align: center;
+  cursor: text;
+}
+.titlebar input.url:hover:not(:read-only) { background: var(--bg-active); }
+.titlebar input.url:focus {
+  outline: none;
+  border-color: var(--accent);
+  color: var(--text);
+  text-align: left;
+}
+.titlebar input.url::placeholder { color: var(--text-faint); }
+
+/* Content collections (schema-driven editor) --------------------------------
+   The controls reuse the CMS ones; what is new here is everything the schema
+   makes possible — a rule under a field, an error on it, a reference to
+   another entry, a kind switcher, and the notices that say when a collection
+   is not ours to write. */
+.content-count { font-size: 10.5px; color: var(--text-faint); }
+
+.content-banner {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  max-width: 720px;
+  margin-bottom: 14px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+}
+.content-banner svg { flex-shrink: 0; margin-top: 1px; }
+.content-banner.soft { background: transparent; }
+
+.content-hint { font-size: 10.5px; color: var(--text-faint); margin-top: 4px; }
+.content-issue { font-size: 10.5px; color: var(--red); margin-top: 4px; }
+.cms-field.has-issue input,
+.cms-field.has-issue textarea,
+.cms-field.has-issue select { border-color: rgba(255, 69, 58, 0.55); }
+.content-required { color: var(--text-faint); }
+.content-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-left: auto;
+}
+.content-warn { font-size: 10.5px; color: var(--yellow, #e0b341); margin-top: 4px; }
+.content-null { font-size: 11.5px; color: var(--text-faint); padding: 6px 0; }
+.content-none {
+  padding: 1px 7px;
+  border-radius: 5px;
+  font-size: 10px;
+  color: var(--text-faint);
+  background: var(--bg-input);
+}
+.content-none.on { color: var(--text); background: rgba(255, 255, 255, 0.12); }
+.cms-field-head .content-clear { margin-left: auto; opacity: 0; padding: 1px; }
+.cms-field:hover .cms-field-head .content-clear { opacity: 1; }
+
+.content-add-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.content-add-field button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 2px 6px;
+}
+.content-default { font-size: 10.5px; color: var(--text-faint); }
+
+.content-tags,
+.content-reflist {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+}
+.content-tags input { flex: 1; min-width: 90px; height: 22px; border: 0; background: transparent; padding: 0 4px; }
+.content-reflist select { flex: 1; min-width: 130px; height: 24px; }
+.content-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.1);
+}
+.content-chip .missing { color: var(--red); }
+.content-chip button { padding: 1px; color: var(--text-faint); background: transparent; }
+
+.content-union-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.content-union-head label { font-size: 11.5px; color: var(--text-dim); }
+.content-union-head select { flex: 1; }
+
+.content-record-row { padding-bottom: 8px; }
+.content-record-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.content-record-head .content-key { font-weight: 600; }
+.content-record-add { display: flex; gap: 6px; align-items: center; }
+.content-record-add input { flex: 1; }
+
+.content-simple-list { display: flex; flex-direction: column; gap: 5px; align-items: stretch; }
+.content-simple-row { display: flex; gap: 6px; align-items: center; }
+.content-simple-row > *:first-child { flex: 1; min-width: 0; }
+.content-open-item {
+  padding: 10px;
+  margin: 2px 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+}
+.content-body-note { font-size: 10.5px; color: var(--text-faint); margin-bottom: 6px; }
+/* The body is an editor, not a growing textarea: a long post would push every
+   other field off the screen, so it scrolls within a window big enough to
+   write in. Bordered like the fields around it so the card still reads as one
+   form. */
+.content-body-editor {
+  border: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--bg-input);
+  min-height: 260px;
+  max-height: 60vh;
+  overflow: hidden;
+  display: flex;
+}
+.content-body-editor .cm-host { flex: 1; min-width: 0; overflow: auto; }
+.content-body-editor .cm-editor { height: 100%; }
+
+.content-id {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-family: var(--mono, ui-monospace, monospace);
+  padding: 2px 6px;
+  border-radius: 5px;
+}
+.content-id:hover { color: var(--text); background: rgba(255, 255, 255, 0.08); }
+.content-rename {
+  max-width: 720px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+}
+.content-rename-row { display: flex; gap: 6px; align-items: center; }
+.content-rename-row label { font-size: 11.5px; color: var(--text-dim); }
+.content-rename-row input { flex: 1; }
+.content-rename-plan {
+  margin-top: 10px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.content-rename-plan .primary { margin-top: 8px; }
+.content-pointer { font-size: 10.5px; color: var(--text-faint); }
+
+/* Variables sheet -----------------------------------------------------------
+   The same sheet the CMS uses, with a table in it. Columns are either the
+   rules a variable is declared in (a theme and its modes) or the things a
+   family of names describes (h1…h6) — see electron/cssVars.js. */
+.vars-view .cms-detail { width: 100%; }
+/* One column geometry for the whole sheet: every table lays its columns on the
+   same tracks, so names and values line up from the top of the group to the
+   bottom whatever each block holds. Wide sets scroll (the body's overflow-y
+   makes the x axis scrollable too) rather than squeezing the columns. */
+.vars-body {
+  padding-bottom: 40px;
+  /* The sheet's own left/right inset. It lives INSIDE the rows (the first grid
+     track carries it, see VariablesView), not on this body: the rows have to
+     reach the panel's edges so their rules do, and so the sticky name column
+     has an edge to sit against. */
+  padding-left: 0;
+  padding-right: 0;
+  --vars-inset: 24px;
+  --vars-name-col: 200px;
+  --vars-col: 260px;
+  /* One group at a time scrolls sideways (each table's value stack is its own
+     scroller), so the sheet itself never does — otherwise a single wide group
+     would drag every other group's names off with it. */
+  overflow-x: hidden;
+}
+/* A group is two stacks: the labels, which never move, and a scroller holding
+   its values. Only the right-hand one scrolls, so a row always says what it is
+   — and nothing has to be held in place against the scroll. */
+.vars-table {
+  margin-bottom: 22px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+}
+/* The horizontal bar lands on the group's "New variable" line, because the
+   value side has no row of its own down there — see Table. The bar sits at the
+   bottom of this box, so the padding is what centres it in that line: half a
+   row (15px) puts the bar's own middle (it is 8px tall) on the row's middle. */
+/* The value stack no longer scrolls as one box. A heading has to sit outside a
+   horizontal scroller to stick to the sheet — a box that scrolls in x is a
+   scroll container in both axes, and `position: sticky` inside one resolves
+   against that box, so the headings rode the rows out of sight. The scrolling
+   moved down to the rows; the heading strip above them is held level with it
+   from VariablesView. The room for the scrollbar goes with the scroller. */
+.vars-scroll { min-width: 0; }
+.vars-scroll-rows {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  min-width: 0;
+  padding-bottom: 19px;
+}
+.vars-scroll-head { overflow: hidden; min-width: 0; }
+
+/* A group's name and its column headings stay with you while its own rows go
+   past, and give way to the next group's — which is what says which group you
+   are reading once the top of it has gone. Both stacks, or the two halves of a
+   line would part company. Opaque, or the rows show through. */
+/* The selector's column headings, over every group in the sheet. Above the
+   group titles, which come to rest just under them. */
+.vars-sheet-head {
+  position: sticky;
+  top: calc(-1 * var(--cms-body-inset));
+  z-index: 4;
+  background: var(--bg);
+}
+
+/* A group's title stops below the headings rather than over them — the height
+   is measured in VariablesView, since a row's is set here and reading it back
+   beats writing the number down twice. */
+.vars-fixed-head,
+.vars-scroll-head {
+  position: sticky;
+  /* The sheet's body is inset from the top, and sticky measures from the
+     content edge — so at top:0 the heading came to rest below that inset and
+     rows slid through the band above it. Pulled up by the same amount, it
+     stops flush against the sheet's head and nothing passes over it. It still
+     sits at its natural place until it has something to stick to. */
+  top: calc(var(--vars-head-h, 30px) - var(--cms-body-inset));
+  z-index: 3;
+  /* The sheet's own background — .cms-view paints it, and the body over it is
+     transparent, so anything else here reads as a band of a different colour. */
+  background: var(--bg);
+}
+/* The rows carry the inset themselves; anything else in the sheet (the
+   no-results line) still needs it. */
+.vars-body > .props-empty { padding-left: var(--vars-inset); }
+.vars-search {
+  height: 24px;
+  width: 180px;
+  margin-left: auto;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+/* A group heading is a row too: same height, lined up with the names under it,
+   lights up on hover, and drags by the same grip. The space between groups is
+   the table's, not the heading's — a margin here would make the heading row
+   taller than the rows it heads. */
+.vars-section {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+}
+/* The name sits in the label stack, so it can run past the name track's width
+   without meeting anything. The menu goes in the same cell, at its end. */
+/* Both sit in the SAME cell — the row is a grid, and two items given the same
+   column but no row are placed one under the other, which made the heading two
+   rows tall in the name stack and one in the value stack beside it. Every line
+   in the sheet is drawn across both, so that put the whole sheet out of step. */
+.vars-section-text { grid-column: 2 / -1; grid-row: 1; white-space: nowrap; }
+.vars-section .vars-section-menu { grid-column: 2 / -1; grid-row: 1; justify-self: end; }
+/* Shown on hover of the heading, the way the drag grip is: three dots on every
+   group at rest is a column of noise down a sheet that is mostly names. */
+.vars-section-menu {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 20px;
+  margin-right: 6px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-dim);
+  opacity: 0;
+  cursor: pointer;
+}
+.vars-section:hover .vars-section-menu,
+.vars-section-menu.is-open,
+.vars-section-menu:focus-visible { opacity: 1; }
+.vars-section-menu:hover:not(:disabled),
+.vars-section-menu.is-open { background: rgba(255, 255, 255, 0.09); color: var(--text); }
+
+/* The menu itself — portaled, so it is styled from here rather than inherited. */
+/* The `⋯` menu (src/ui/MoreMenu.jsx), wherever it is opened from. The old
+   .vars-* names are kept beside the new ones: the variables sheet had this
+   first, and its own rows are still styled by them. */
+.more-menu-item:disabled { opacity: 0.4; cursor: default; }
+
+/* On a tile, and only while the pointer is on it — an asset grid is a wall of
+   pictures, and a button in the corner of every one of them is a wall of
+   buttons. Focus shows it too, so it can be reached without a pointer. */
+.asset-tile { position: relative; }
+.asset-tile-menu {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 6px;
+  background: rgba(20, 20, 20, 0.72);
+  border: 1px solid var(--border);
+  color: var(--text);
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+.asset-tile:hover .asset-tile-menu,
+.asset-tile-menu:focus-visible,
+.asset-tile-menu.is-open { opacity: 1; }
+.asset-tile-menu:hover:not(:disabled) { background: rgba(20, 20, 20, 0.9); }
+
+.vars-menu,
+.more-menu {
+  z-index: 60;
+  min-width: 150px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-raised, #2a2a2a);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+.vars-menu-item,
+.more-menu-item {
+  display: flex;
+  align-items: center;
+  /* The app centres bare buttons (see the `button` rule at the top of this
+     file), and this menu is portaled to <body>, outside the panel's reset — so
+     its rows came out centred. A menu reads down its left edge. */
+  justify-content: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.vars-menu-item:hover:not(:disabled),
+.more-menu-item:hover:not(:disabled) { background: rgba(255, 255, 255, 0.09); }
+.vars-menu-item > svg,
+.more-menu-item > svg { color: var(--text-dim); flex: none; }
+.vars-menu-item.is-danger:hover:not(:disabled),
+.more-menu-item.is-danger:hover:not(:disabled) { background: rgba(255, 90, 90, 0.16); color: #ff9b9b; }
+.vars-menu-item.is-danger:hover > svg { color: #ff9b9b; }
+/* A row is a grid of its own — a label row in the fixed stack, a value row in
+   the scrolling one — with fixed tracks, so the two stacks line up with each
+   other and every group's columns start at the same x. */
+.vars-row {
+  display: grid;
+  align-items: center;
+  column-gap: 10px;
+  min-width: min-content;
+  padding: 2px 0;
+  /* Every row is the same height, heading or not: the field inside a value row
+     is 26px, and the two padding lines make 30. A heading that measured itself
+     from its own text would sit shorter and break the rhythm of the list. */
+  min-height: 30px;
+}
+/* A row is a label and a value stack side by side, so the highlight is driven
+   from React (see Table) rather than :hover — one half can't light the other. */
+.vars-row.is-hover:not(.is-head) { background: rgba(255, 255, 255, 0.055); }
+/* The sheet is a table: the rows and the fields in it are square. The rows'
+   radius curled the ends of every rule, and a rounded field box on each value
+   read as a chip sitting in a column of chips.
+   The colour box keeps its corners — it is a swatch rather than a field, it
+   reads as one everywhere else in the app, and a hard-edged square of colour
+   against the round-cornered chip beside it looked like a mistake. */
+.vars-body .vars-row,
+.vars-body .u-input,
+.vars-body .var-input { border-radius: 0; }
+/* The sheet's right-hand inset, and room at the left of the value stack for the
+   connect dot: it sits on the field's left edge and grows on hover, and the
+   scroller clips whatever hangs past its edge — which cropped the first
+   column's dot in half. 22px clears it at its hovered size. */
+.vars-scroll .vars-row { padding: 2px var(--vars-inset) 2px 22px; }
+/* The two rule lines in the sheet: one under the group's name, one under the
+   column labels — so the name, the labels and the values each sit in their own
+   band. Rows are separated by hover, not borders; these are the only lines.
+   Plain borders reach the panel's edges now that the rows do: the inset moved
+   into the first grid track, so a row's box starts at the panel's left edge and
+   runs to at least its right one. */
+.vars-section,
+.vars-row.is-head {
+  border-bottom: 1px solid var(--border);
+}
+.vars-row.is-head {
+  padding-bottom: 6px;
+  margin-bottom: 4px;
+}
+.vars-grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding-left: var(--vars-inset);
+  height: 100%;
+  color: var(--text-faint);
+  cursor: grab;
+}
+.vars-grip > svg { opacity: 0; }
+.vars-row:hover .vars-grip > svg { opacity: 1; }
+.vars-grip:active { cursor: grabbing; }
+/* While a row is being dragged, and where it would land. */
+.vars-row.is-dragging { background: rgba(255, 255, 255, 0.09); opacity: 0.75; }
+.vars-row.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+.vars-row.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+
+.vars-name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  padding: 3px 2px;
+  min-width: 0;
+}
+.vars-name > svg { color: var(--text-faint); }
+.vars-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Value, colour box and field: the box is beside the field, not in it, and the
+   text starts at the left edge of the field like every other input in the app. */
+.var-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.var-cell.empty { color: var(--text-faint); font-size: 11px; padding-left: 8px; }
+.var-cell .u-color-swatch {
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  border-radius: 5px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  /* Under a colour that does not fill it — a translucent one, or one nothing
+     can compute — the checkerboard shows through. */
+  background:
+    repeating-conic-gradient(rgba(255, 255, 255, 0.22) 0% 25%, transparent 0% 50%) 0 0 / 8px 8px,
+    #3a3a3a;
+}
+/* The curve button: the same size and quiet weight as a colour's swatch, so a
+   row with one does not read as busier than a row with the other. */
+.var-ease {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.var-ease:hover { color: var(--text); border-color: var(--border-strong); }
+/* The curve glyph is the editor's own preset thumbnail, which sizes itself to
+   its box (width/height: 100%) — inside a 22px button that box has to be
+   stated, or the drawing takes whatever room the row will give it. */
+.var-ease svg { width: 15px; height: 15px; flex: none; }
+.var-cell .varconnect,
+.var-cell .embed-editor_varconnect { flex: 1; min-width: 0; }
+/* A field with a box around it, on every row, is a wall of boxes — and the
+   value is the thing to read, not the input holding it. So the field is
+   nothing until it is the one under the pointer (or the one being typed in),
+   which is also when the connect dot appears. */
+.var-input {
+  width: 100%;
+  height: 26px;
+  padding: 0 8px;
+  text-align: left;
+  font-size: 11.5px;
+  font-family: var(--mono, ui-monospace, monospace);
+  background: transparent;
+  border-color: transparent;
+}
+/* The token editor stands in for the input and wears its class, so hovering
+   either — the field, or the chip-bearing editor over it — lights the field.
+   The wrapper is the hover target, since the dot sits inside it. */
+.var-cell .embed-editor_varconnect:hover .var-input,
+.var-input:hover,
+.var-input:focus {
+  background: var(--bg-input);
+}
+.var-input:focus { border-color: var(--accent); }
+
+/* A branch holding work that was set aside on the way out. */
+/* The file picker on the commit box. Closed by default: someone who just
+   wants to save everything should never have to read a file list to do it. */
+.git-pick-toggle { width: 100%; font-size: 11px; padding: 4px; }
+.git-pick {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.git-pick-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.git-pick-head button { font-size: 10.5px; padding: 2px 4px; }
+.git-pick-count { font-size: 10px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.git-pick-list { max-height: 220px; overflow-y: auto; padding: 2px; }
+/* The heading toggles its whole group — "just the stylesheets" is the shape of
+   most real picks, and hunting them out of a flat list is not. */
+.git-pick-group + .git-pick-group { margin-top: 4px; }
+.git-pick-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 4px 3px;
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.git-pick-group-head:hover { color: var(--text-dim); }
+.git-pick-group-count { font-weight: 500; letter-spacing: 0; }
+.git-pick-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  border-radius: 4px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.git-pick-row:hover { background: var(--bg-hover); color: var(--text); }
+.git-pick-row input { margin: 0; flex-shrink: 0; }
+.git-pick-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The real filename, when the friendly name hides it: "Home" does not say
+   index.astro, and which file is being saved is the whole question here. */
+.git-pick-file {
+  margin-left: auto;
+  padding-left: 6px;
+  font-size: 10px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* File browser                                                        */
+/* ------------------------------------------------------------------ */
+
+.file-browser { display: flex; flex-direction: column; min-height: 0; }
+.fb-search { display: flex; align-items: center; gap: 4px; padding: 0 0 6px; }
+.fb-search input { flex: 1; font-size: 11.5px; }
+.fb-search .ghost { padding: 2px 6px; font-size: 14px; line-height: 1; color: var(--text-faint); }
+
+.fb-list { flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; }
+.fb-empty { padding: 10px 6px; font-size: 11.5px; color: var(--text-faint); }
+
+.fb-row,
+.fb-folder {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding-right: 6px;
+  border-radius: 5px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.fb-row:hover, .fb-folder:hover { background: var(--bg-hover); color: var(--text); }
+/* The row the arrow keys are on, so the field can be driven without the mouse. */
+.fb-row.active { background: var(--bg-active); color: var(--text); }
+.fb-row.on { color: var(--text); }
+.fb-row input, .fb-folder input { margin: 0; flex-shrink: 0; }
+
+.fb-folder-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font-size: inherit;
+  cursor: pointer;
+}
+.fb-caret { display: flex; color: var(--text-faint); flex-shrink: 0; }
+.fb-folder-icon { display: flex; color: var(--text-faint); flex-shrink: 0; }
+.fb-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.fb-count { font-size: 10px; color: var(--text-faint); flex-shrink: 0; }
+/* Only shown while searching — in the tree the indentation already says where
+   a file is, and repeating it on every row would be noise. */
+.fb-dir {
+  font-size: 10px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  max-width: 45%;
+  flex-shrink: 0;
+}
+
+.fb-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.fb-foot .ghost { font-size: 10.5px; padding: 2px 4px; }
+.fb-selected { font-size: 10px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+
+/* ------------------------------------------------------------------ */
+/* History panel                                                       */
+/* ------------------------------------------------------------------ */
+
+.history-body { padding-top: 0; }
+
+.history-section + .history-section { margin-top: 4px; border-top: 1px solid var(--border); }
+.history-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 9px 4px 7px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+.history-section-head:hover { color: var(--text); }
+.history-section-title { flex: 1; text-align: left; }
+.history-section-count {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-faint);
+  background: var(--surface-2, rgba(255, 255, 255, 0.06));
+  padding: 1px 6px;
+  border-radius: 999px;
+}
+
+/* A date is a heading over the commits under it, not a row of its own — it
+   should read as a label on the group and never be mistaken for something
+   clickable. */
+.history-day {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  padding: 10px 4px 4px;
+}
+
+.history-commit { border-radius: 6px; }
+.history-commit.previewing { background: var(--accent-soft); }
+.history-commit-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+}
+.history-commit-head:hover { background: var(--bg-hover); }
+/* The dot is the timeline: one per commit, in a column, so the eye has a line
+   to run down rather than a list of paragraphs. */
+.history-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex-shrink: 0;
+  margin-top: 5px;
+}
+.history-commit.previewing .history-dot { background: var(--accent); }
+.history-commit-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.history-subject {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.history-meta {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-commit-body { padding: 2px 8px 10px 23px; display: flex; flex-direction: column; gap: 8px; }
+.history-files { display: flex; flex-direction: column; }
+.history-file {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 4px;
+  border-radius: 4px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.history-file:hover { background: var(--bg-hover); }
+.history-file.muted { color: var(--text-faint); font-style: italic; }
+.history-file-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A word, not a letter: "M" needed explaining, which is a sign it was the
+   wrong thing to show. Quiet enough not to lead the row — the file's name is
+   what anyone is reading for — and colour-coded so the kind of change reads
+   before the word does. */
+.file-status {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  white-space: nowrap;
+  color: var(--text-faint);
+  background: var(--surface-2, rgba(255, 255, 255, 0.06));
+}
+.file-status.s-A { color: var(--green); background: rgba(48, 193, 88, 0.14); }
+.file-status.s-M { color: var(--accent); background: var(--accent-soft); }
+.file-status.s-D { color: var(--red); background: rgba(255, 69, 58, 0.14); }
+.file-status.s-R,
+.file-status.s-C { color: var(--text-dim); }
+.file-status.s-U { color: #ffcb6b; background: rgba(255, 203, 107, 0.14); }
+
+.history-commit-actions { display: flex; flex-direction: column; gap: 5px; }
+.history-commit-actions button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 11.5px;
+}
+.history-hash { font-size: 10px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+
+.history-more,
+.history-exit-preview {
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px;
+  font-size: 11.5px;
+}
+.history-exit-preview { margin: 8px 0; background: var(--accent); color: #fff; border-color: var(--accent); }
+
+.history-empty,
+.history-note {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-faint);
+  padding: 4px 4px 8px;
+}
+.history-error { font-size: 11.5px; line-height: 1.5; color: var(--red); padding: 4px; }
+
+/* Branch rows keep their actions visible. Hover-revealed icons meant that
+   until you happened to hover a row there was no sign the app could merge or
+   delete anything — dim is quiet enough, and findable. */
+.list-item .row-action.merge,
+.list-item .row-action.branch-action { opacity: 0.45; }
+.list-item:hover .row-action.merge,
+.list-item:hover .row-action.branch-action { opacity: 1; }
+/* Disabled ones stay put rather than vanishing: a greyed button that says why
+   is a better answer than a row that is missing something. */
+.list-item .row-action:disabled,
+.list-item:hover .row-action:disabled {
+  opacity: 0.18;
+  cursor: default;
+  background: none;
+}
+.list-item .row-action:disabled:hover { color: var(--text-faint); background: none; }
+
+/* Merging is not a destructive act, so it does not get the red the other row
+   actions turn on hover — a branch row would otherwise say "danger" twice and
+   mean it once. */
+.list-item .row-action.merge:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+.list-item .row-action:disabled { opacity: 0.35; cursor: default; }
+.list-item:hover .row-action:disabled { opacity: 0.35; }
+
+.branch-parked {
+  margin-left: auto;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--text-dim, #9aa0a6);
+  background: var(--surface-2, rgba(255, 255, 255, 0.06));
+  white-space: nowrap;
+}
+
+/* Custom value ---------------------------------------------------------------
+   A long value is a long expression, and the thing that makes one editable is
+   seeing all of it at once. Clicking a value that does not fit its column (or
+   pressing "=" in any field) opens it here, in the same field the cell uses —
+   so the variable chips inside it stay chips. */
+.var-custom {
+  position: fixed;
+  /* Above the style panel's modals, which run from 1000 up on their own scale:
+     this opens FROM a field inside one (a grid track, the whole track list), so
+     opening behind it is the one place it must never be. Still under the
+     tooltip layer. */
+  z-index: 1100;
+  width: 440px;
+  max-width: calc(100vw - 24px);
+  display: flex;
+  flex-direction: column;
+  background: #232323;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.6);
+  padding: 10px;
+}
+.var-custom-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+.var-custom-name {
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--text-faint);
+  font-family: var(--mono, ui-monospace, monospace);
+  margin-left: auto;
+}
+.var-custom-input {
+  width: 100%;
+  min-height: 92px;
+  padding: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  font-family: var(--mono, ui-monospace, monospace);
+  resize: vertical;
+}
+.var-custom-foot { font-size: 10.5px; color: var(--text-faint); margin-top: 8px; }
+/* The token editor is single-line by default (it stands in for an <input>).
+   Here it stands in for a textarea, so it wraps and grows instead. */
+.embed-editor_varconnect.is-multiline.is-token > .embed-editor_varconnect-editor {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-y: auto;
+  min-height: 92px;
+  max-height: 40vh;
+  line-height: 1.6;
+}
+.embed-editor_varconnect.is-multiline { display: block; width: 100%; }
+
+/* Selection, app-wide.
+   Chromium's default is the system accent, which changes with the user's OS
+   settings and does not belong to this interface. Set here so a selected value
+   looks the same in a panel field, a name in the navigator and a line of code.
+   The canvas is an iframe rendering someone's own site and is not touched. */
+::selection {
+  background: var(--selection);
+  color: var(--selection-text);
+}
+input::selection,
+textarea::selection {
+  background: var(--selection);
+  color: var(--selection-text);
+}
+
+/* The last line of a group: what adds a variable to it. It reads as a row so
+   the list ends where the rows do, and it is quiet until it is wanted. */
+.vars-add-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  /* No left padding, and no stretching: a button is centred and full-width by
+     default in this app, which as a grid item put "New variable" in the middle
+     of the name column instead of at the start of it. It lines up with the
+     glyphs of the variables above it. */
+  padding: 2px 4px 2px 0;
+  background: transparent;
+  justify-self: start;
+  justify-content: flex-start;
+}
+.vars-row:hover .vars-add-btn,
+.vars-add-btn:hover { color: var(--text-dim); }
+.vars-add-field { display: flex; align-items: center; gap: 2px; min-width: 0; }
+/* The part of the name the group has already decided — typed names follow it. */
+.vars-add-stem {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.vars-add-field input {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  padding: 0 6px;
+  font-size: 11.5px;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+
+/* Renaming, in place ---------------------------------------------------------
+   A variable's name and a group's heading are text you can click into. Until
+   clicked they have to read as the text they replaced and nothing else — this
+   app styles bare buttons (filled, centred, rounded), so the reset is the point
+   of these rules, not decoration. */
+.vars-rename {
+  appearance: none;
+  display: block;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: text;
+}
+/* The one hint that it can be renamed: the name lifts to full strength under
+   the pointer. No box — a box on every name in the sheet is noise. */
+.vars-rename:hover:not(:disabled) { background: none; color: var(--text); }
+.vars-section-text.vars-rename { width: auto; grid-column: 2 / -1; }
+/* Sized so the row does not change height when it opens: the field is as tall as
+   the name box it replaces, and the negative margin gives back the padding that
+   box puts around its text. A row that grows under the pointer moves every row
+   below it, in a sheet you are reading down. */
+.vars-rename-input {
+  width: 100%;
+  min-width: 0;
+  height: 20px;
+  margin-block: -3px;
+  padding: 0 4px;
+  font: inherit;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+/* The heading's field is as wide as the name track rather than the whole row,
+   so renaming a group does not stretch a text box across the sheet. */
+.vars-section .vars-rename-input { grid-column: 2 / 3; }
+
+/* Fluid type accessibility ---------------------------------------------------
+   A badge beside a clamp() that a reader cannot enlarge: red where the value
+   never doubles at 500% zoom, orange where it ignores the reader's font size.
+   The message itself is drawn on the document (see FluidBadge), because the
+   column the badge sits in scrolls and would crop it. */
+.fluid-badge {
+  --fluid-badge-size: 13px;
+  flex-shrink: 0;
+  width: var(--fluid-badge-size);
+  height: var(--fluid-badge-size);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  cursor: help;
+}
+.fluid-badge.is-error { color: #ff6161; cursor: pointer; }
+.fluid-badge.is-warning { color: #ffba17; }
+.fluid-badge-icon { display: block; width: 100%; height: 100%; }
+.fluid-badge-icon svg { display: block; width: 100%; height: 100%; }
+
+.fluid-tip {
+  position: fixed;
+  z-index: 500;
+  padding: 8px 11px;
+  border-radius: 8px;
+  background: #2f2f2f;
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 12px 26px rgba(0, 0, 0, 0.45);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+  text-align: left;
+  pointer-events: none;
+}
+.fluid-tip-more { display: block; margin-top: 4px; color: var(--accent); }
+
+/* A source inside an expression, drawn as a chip. It is painted over ordinary
+   text, so everything after it — .filter(…), [1] — is typed the way it reads,
+   and the value is always exactly what the field holds. */
+.expr-input .cm-chip {
+  background: rgba(146, 116, 255, 0.24);
+  color: #cbbcff;
+  border-radius: 5px;
+  padding: 1px 5px;
+  cursor: pointer;
+}
+.expr-input .cm-chip:hover { background: rgba(146, 116, 255, 0.34); }
+
+/* The condition field, and the dot that inserts into it — the same arrangement
+   the attribute editor's value uses (see .attr-value-field). */
+.props-cond-field { display: flex; }
+.props-cond-field > .expr-input { flex: 1; min-width: 0; }
+
+/* Start from a template: a name, where it goes, and what that means. */
+.starter-field { display: flex; flex-direction: column; gap: 6px; }
+.starter-field > span { font-size: 11.5px; color: var(--text-dim); }
+.starter-note {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-faint);
+}
+.starter-note code {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* The third way to start: real, but not competing with the two above it. */
+.welcome .actions .quiet {
+  background: transparent;
+  color: var(--text-faint);
+  border-color: transparent;
+}
+.welcome .actions .quiet:hover:not(:disabled) { background: rgba(255, 255, 255, 0.06); color: var(--text-dim); }
+
+/* ─────────────────────── Find in a code block (⌘F) ───────────────────────
+   CodeMirror's search panel is real UI — its own field, its own buttons, its
+   own toggles — arriving with browser-default chrome in the middle of an app
+   that has none. It looked like a form pasted into the editor. The markup is
+   CodeMirror's (so every command, shortcut and screen-reader label keeps
+   working); everything you can see about it is ours.
+
+   Row one is the query and what to do with it; row two is the replacement.
+   The break between them is the panel's own `<br>`, which flexbox turns into a
+   line break when given the full width. */
+
+.cm-editor .cm-panels {
+  background: var(--bg-panel-2);
+  color: var(--text);
+  border: none;
+}
+.cm-editor .cm-panels.cm-panels-bottom { border-top: 1px solid var(--border); }
+.cm-editor .cm-panels.cm-panels-top { border-bottom: 1px solid var(--border); }
+
+.cm-editor .cm-panels .cm-panel.cm-search {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  /* Right padding clears the close button, which the panel positions itself. */
+  padding: 8px 40px 8px 8px;
+  font-family: var(--font);
+  font-size: 12px;
+}
+.cm-editor .cm-panels .cm-panel.cm-search br {
+  flex-basis: 100%;
+  height: 0;
+  margin: 0;
+}
+
+/* The two fields. Both grow; the query carries a magnifier so the row reads as
+   a search before you read the placeholder. */
+.cm-editor .cm-panels .cm-panel.cm-search input.cm-textfield {
+  flex: 1 1 200px;
+  min-width: 0;
+  height: 28px;
+  margin: 0;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  /* background-COLOR, not the shorthand: the query field paints a magnifier as
+     its background image, and a shorthand here (or on :focus) would wipe it. */
+  background-color: var(--bg-input);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.cm-editor .cm-panels .cm-panel.cm-search input[name=search] {
+  padding-left: 28px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23999999' stroke-width='1.5'%3E%3Ccircle cx='7' cy='7' r='4.25'/%3E%3Cpath d='M10.2 10.2 13.5 13.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 8px center;
+  background-size: 14px 14px;
+}
+.cm-editor .cm-panels .cm-panel.cm-search input.cm-textfield::placeholder { color: var(--text-faint); }
+.cm-editor .cm-panels .cm-panel.cm-search input.cm-textfield:focus {
+  outline: none;
+  border-color: var(--accent);
+  background-color: var(--bg-active);
+}
+
+/* next / previous / all / replace / replace all. */
+.cm-editor .cm-panels .cm-panel.cm-search .cm-button {
+  flex: 0 0 auto;
+  height: 28px;
+  margin: 0;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  background-image: none;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 500;
+}
+.cm-editor .cm-panels .cm-panel.cm-search .cm-button:hover { background: var(--bg-active); }
+.cm-editor .cm-panels .cm-panel.cm-search .cm-button:active { background-image: none; }
+
+/* match case / regexp / by word — options, so they read as toggles that are on
+   or off rather than as a form to fill in. The checkbox itself is taken out of
+   sight (the chip's own fill says whether it's on) but stays focusable, and the
+   ring lands on the chip. */
+.cm-editor .cm-panels .cm-panel.cm-search label {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  margin: 0;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  font-family: var(--font);
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+.cm-editor .cm-panels .cm-panel.cm-search label:hover { background: var(--bg-hover); color: var(--text); }
+.cm-editor .cm-panels .cm-panel.cm-search label:has(:checked) {
+  background: var(--accent-soft);
+  border-color: rgba(0, 153, 255, 0.45);
+  color: var(--text);
+}
+.cm-editor .cm-panels .cm-panel.cm-search label:has(:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.cm-editor .cm-panels .cm-panel.cm-search label input[type=checkbox] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* The close ×, which the panel pins to its top-right corner. */
+.cm-editor .cm-panels .cm-panel.cm-search [name=close] {
+  top: 8px;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+.cm-editor .cm-panels .cm-panel.cm-search [name=close]:hover { background: var(--bg-hover); color: var(--text); }
+
+/* Narrow editors — the CSS box in the style panel is about 300px wide, where a
+   row of words wraps to one control per line and the search bar eats half the
+   editor. Below the width the full labels need, the query takes a line of its
+   own and the controls become the symbols they stand for. The words stay in the
+   markup (so the buttons still announce themselves), they just aren't drawn. */
+.cm-editor .cm-panels { container-type: inline-size; }
+
+@container (width < 430px) {
+  .cm-editor .cm-panels .cm-panel.cm-search input[name=search] { flex-basis: 100%; }
+  .cm-editor .cm-panels .cm-panel.cm-search .cm-button[name=next],
+  .cm-editor .cm-panels .cm-panel.cm-search .cm-button[name=prev],
+  .cm-editor .cm-panels .cm-panel.cm-search label {
+    justify-content: center;
+    min-width: 32px;
+    padding: 0 8px;
+    font-size: 0;
+  }
+  .cm-editor .cm-panels .cm-panel.cm-search .cm-button[name=next]::after,
+  .cm-editor .cm-panels .cm-panel.cm-search .cm-button[name=prev]::after,
+  .cm-editor .cm-panels .cm-panel.cm-search label::after {
+    font-family: var(--font);
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1;
+  }
+  .cm-editor .cm-panels .cm-panel.cm-search .cm-button[name=next]::after { content: '↓'; font-size: 13px; }
+  .cm-editor .cm-panels .cm-panel.cm-search .cm-button[name=prev]::after { content: '↑'; font-size: 13px; }
+  .cm-editor .cm-panels .cm-panel.cm-search label:has([name=case])::after { content: 'Aa'; }
+  .cm-editor .cm-panels .cm-panel.cm-search label:has([name=re])::after { content: '.*'; }
+  .cm-editor .cm-panels .cm-panel.cm-search label:has([name=word])::after { content: 'ab'; }
+}
+
+/* What is wrong with a statement, under the field that holds it. Only ever
+   shown after a commit was refused — the write is the thing being explained,
+   so there is nothing to say until one was attempted. */
+.var-src-error {
+  padding: 6px 8px 2px;
+  color: var(--red);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+/* ------------------------------------------------------------------ */
+/* Terminal dock                                                       */
+/* ------------------------------------------------------------------ */
+
+/* Sits below `.main`, spanning the full window. Height is driven from React
+   (0 when closed) so the flex column above simply reclaims the space. */
+.term-dock {
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+}
+/* Closed: the border would still hold a 1px strip of dead space, and nothing
+   inside should take focus or a click. */
+.term-dock:not(.on) { border-top-width: 0; visibility: hidden; }
+
+/* Grab strip straddling the top edge — a few px taller than it looks, because
+   a 1px target is a 1px target. */
+.term-resize {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 5px;
+  z-index: 3;
+  cursor: ns-resize;
+}
+.term-resize:hover, .term-resize.on { background: var(--accent); }
+
+.term-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px 5px 10px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.term-tabs {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.term-tabs::-webkit-scrollbar { display: none; }
+
+.term-tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 7px;
+  flex-shrink: 0;
+  background: transparent;
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+.term-tab:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+.term-tab.on { background: var(--bg-active); color: var(--text); }
+.term-tab-label { font-family: var(--mono); font-size: 11px; }
+.term-tab-x {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  color: var(--text-faint);
+  opacity: 0.7;
+}
+.term-tab-x:hover { opacity: 1; background: var(--bg-active); color: var(--text); }
+.term-add { flex-shrink: 0; }
+
+.term-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+/* Overrides .dd-trigger's full-width, panel-sized default — this one sits in a
+   dense toolbar, not a properties row. */
+.term-launch {
+  width: 128px;
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+.term-custom {
+  width: 170px;
+  height: 24px;
+  padding: 0 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.term-panes { flex: 1; min-height: 0; position: relative; }
+.term-pane-wrap { height: 100%; }
+.term-pane { position: relative; height: 100%; }
+/* xterm measures its host, so the padding lives here rather than on .xterm —
+   padding on the terminal element itself would be counted as usable columns
+   and the last one would be clipped. */
+.term-host { height: 100%; padding: 6px 4px 6px 10px; }
+.term-host .xterm { height: 100%; }
+.term-host .xterm-viewport { background-color: transparent !important; }
+
+.term-scroll-btn {
+  position: absolute;
+  right: 18px;
+  bottom: 12px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text-dim);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.4);
+}
+.term-scroll-btn:hover:not(:disabled) { background: var(--bg-active); color: var(--text); }

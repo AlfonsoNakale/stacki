@@ -30,10 +30,12 @@ export const BREAKPOINTS: readonly BreakpointDef[] = [
   { id: 'tiny', label: 'Mobile', media: '(max-width: 479px)' },
 ]
 
-// Webflow's three below-desktop breakpoints are always available in the Designer,
-// so the dropdown always lists them (with a dot when the element has native styles
-// there). The larger min-width breakpoints only appear when they carry styles.
-const ALWAYS_SHOWN_BREAKPOINTS: ReadonlySet<BreakpointId> = new Set(['medium', 'small', 'tiny'])
+// No breakpoint is listed for its own sake. Tablet, Mobile (L) and Mobile used
+// to be, because a Webflow project always has them; an Astro one does not, and
+// three device widths nobody had written a rule for sat above the queries the
+// project actually uses. Every breakpoint now appears on the same terms as the
+// desktop ones — when it carries styles — so a project that does use them still
+// sees them, and one that does not is not asked to scroll past them.
 
 // The panel's interaction state → Webflow pseudo (null = base / noPseudo).
 const PSEUDO_FOR_STATE: Record<StateKey, string | null> = {
@@ -144,6 +146,10 @@ export function buildStyleContexts(
   /** Embed at-contexts where the selected element actually has styles. Custom
    *  queries and up-breakpoints only appear in the list when they're in here. */
   styledEmbedContexts: ReadonlySet<string> = new Set(),
+  /** At-contexts belonging to the file being written into — the open component's
+   *  own queries. They lead the custom-query group; ones reaching this element
+   *  from somewhere else in the project follow. */
+  ownContexts: ReadonlySet<string> = new Set(),
 ): StyleContext[] {
   const list: StyleContext[] = []
   const usedBp = new Set<BreakpointId>()
@@ -159,13 +165,13 @@ export function buildStyleContexts(
     }
     const bp = breakpointForAtContext(key)
     if (bp) {
-      // A breakpoint query: the default ones (Tablet/Mobile) always show; the rest
-      // only when they carry values (native, or the element has styles here). Key
-      // it by `bp:<id>` (NOT the embed @media string) so the selected breakpoint
-      // stays stable across elements — different elements may or may not have an
-      // equivalent embed @media, but Tablet is always Tablet.
+      // A breakpoint query, listed when it carries values — native, or the
+      // element has styles here. Key it by `bp:<id>` (NOT the embed @media
+      // string) so the selected breakpoint stays stable across elements —
+      // different elements may or may not have an equivalent embed @media, but
+      // Tablet is always Tablet.
       if (usedBp.has(bp)) return
-      if (!ALWAYS_SHOWN_BREAKPOINTS.has(bp) && !nativeBps.has(bp) && !styledEmbedContexts.has(key)) return
+      if (!nativeBps.has(bp) && !styledEmbedContexts.has(key)) return
       usedBp.add(bp)
       list.push({ key: `bp:${bp}`, label: breakpointLabel(bp), breakpoint: bp, embedAtContext: key })
     } else {
@@ -176,23 +182,29 @@ export function buildStyleContexts(
     }
   })
 
+  // Any breakpoint the loop above did not reach, on the same terms: it is
+  // listed because something is written there, not because it exists.
   for (const def of BREAKPOINTS) {
     if (def.id === 'main' || usedBp.has(def.id)) continue
-    if (!ALWAYS_SHOWN_BREAKPOINTS.has(def.id) && !nativeBps.has(def.id)) continue
+    if (!nativeBps.has(def.id)) continue
     usedBp.add(def.id)
     list.push({ key: `bp:${def.id}`, label: def.label, breakpoint: def.id, embedAtContext: null })
   }
 
   return list
     .map((context, index) => ({ context, index }))
-    .sort((a, b) => rank(a.context) - rank(b.context) || a.index - b.index)
+    .sort((a, b) => rank(a.context, ownContexts) - rank(b.context, ownContexts) || a.index - b.index)
     .map((entry) => entry.context)
 }
 
-function rank(context: StyleContext): number {
+function rank(context: StyleContext, ownContexts: ReadonlySet<string>): number {
   if (context.key === '') return -1
   if (context.breakpoint) return BREAKPOINTS.findIndex((bp) => bp.id === context.breakpoint)
-  return 100 // non-breakpoint embed contexts (@container, custom @media) last
+  // Non-breakpoint embed contexts (@container, custom @media) come last — and
+  // among those, the open component's own queries come first. They're the ones
+  // being worked on; a query reaching this element from a project-wide stylesheet
+  // is further away in every sense.
+  return ownContexts.has(context.embedAtContext ?? '') ? 100 : 101
 }
 
 /**

@@ -1,5 +1,11 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { FileIcon, ChevronDownIcon, CheckIcon } from './Icons.jsx';
+import { comparePageNames, isCollectionRoute } from '../pageOrder.js';
+import { FileIcon, CollectionIcon, ChevronDownIcon, CheckIcon } from './Icons.jsx';
+
+// Generated routes read the same here as in the Pages panel — same glyph,
+// same purple.
+const PageGlyph = ({ page, size }) =>
+  isCollectionRoute(page?.name) ? <CollectionIcon size={size} /> : <FileIcon size={size} />;
 
 // Title-bar page switcher: shows the current page, opens a searchable list
 // of the project's pages (name or route), picking one switches to it.
@@ -12,11 +18,11 @@ export default function PageSwitcher({ pages, currentPage, onSelect }) {
   const popRef = useRef(null);
   const inputRef = useRef(null);
 
-  const pretty = (p) => p.name.replace(/\.(astro|md)$/i, '');
+  const pretty = (p) => p.name.replace(/\.(astro|mdx?)$/i, '');
   const q = query.trim().toLowerCase();
-  const filtered = (pages || []).filter(
-    (p) => !q || p.name.toLowerCase().includes(q) || p.route.toLowerCase().includes(q)
-  );
+  const filtered = (pages || [])
+    .filter((p) => !q || p.name.toLowerCase().includes(q) || p.route.toLowerCase().includes(q))
+    .sort((a, b) => comparePageNames(a.name, b.name));
 
   useLayoutEffect(() => {
     if (!open || !btnRef.current) return;
@@ -71,11 +77,11 @@ export default function PageSwitcher({ pages, currentPage, onSelect }) {
     <>
       <button
         ref={btnRef}
-        className="page-switch-btn"
+        className={`page-switch-btn ${isCollectionRoute(currentPage?.name) ? 'collection' : ''}`}
         title="Switch page"
         onClick={() => setOpen((o) => !o)}
       >
-        <FileIcon size={12} />
+        <PageGlyph page={currentPage} size={12} />
         <span className="page-switch-label">{currentPage ? pretty(currentPage) : 'No page'}</span>
         <ChevronDownIcon size={10} className="page-switch-chevron" />
       </button>
@@ -100,11 +106,13 @@ export default function PageSwitcher({ pages, currentPage, onSelect }) {
               return (
                 <div
                   key={p.path}
-                  className={`page-menu-item ${i === highlight ? 'highlight' : ''} ${cur ? 'current' : ''}`}
+                  className={`page-menu-item ${isCollectionRoute(p.name) ? 'collection' : ''} ${
+                    i === highlight ? 'highlight' : ''
+                  } ${cur ? 'current' : ''}`}
                   onMouseEnter={() => setHighlight(i)}
                   onClick={() => pick(p)}
                 >
-                  <FileIcon size={12} />
+                  <PageGlyph page={p} size={12} />
                   <span className="page-menu-name">{pretty(p)}</span>
                   <span className="page-menu-route">{p.route}</span>
                   {cur && <CheckIcon size={11} />}

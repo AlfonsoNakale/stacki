@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent, ReactNode } from 'react'
 import { panelBounds } from '../lib/panel-box'
+import { endDragNotes, hoverNote } from '../../ui/sound.js'
 
 export type SelectOption<T extends string> = {
   value: T
@@ -25,6 +26,10 @@ export type SelectOption<T extends string> = {
   /** Opaque tone token exposed on the trigger as `data-tone` when this option is
    *  selected, so the consumer can color the trigger per option (via its CSS). */
   tone?: string
+  /** A control on the row itself — an edit pencil, say. Pressing it closes the
+   *  menu and runs `onSelect` WITHOUT choosing the option: it acts on the option
+   *  rather than picking it. Shown on the hovered/active row only. */
+  action?: { icon: ReactNode; label: string; onSelect: () => void }
 }
 
 type Props<T extends string> = {
@@ -187,6 +192,36 @@ export default function Select<T extends string>({
     emittedRef.current = true
     onPreviewRef.current(option.value)
   }, [open, activeIndex, displayed, value])
+
+  // The highlight moving is a sound, pitched by how far down the list it is: the
+  // first row is the top of the scale, the last is the bottom. Driven off the
+  // highlight rather than off the pointer, so arrowing through a menu sounds
+  // the same as running down it with the mouse — it is the same movement.
+  //
+  // Not on the way in: opening a menu already parks the highlight on the
+  // selected row, and a note for a highlight nobody moved would sound like the
+  // menu answering a question that hadn't been asked.
+  const placedRef = useRef(false)
+  useEffect(() => {
+    if (!open) {
+      // Only on the way closed, never merely WHILE closed. `displayed` is a new
+      // array each render, so this effect runs on every render of every Select
+      // in the panel — and the panel is full of them. Resetting from here
+      // unconditionally meant a closed dropdown wiped the note the open one had
+      // just played, and the open one then played the same row again: two notes
+      // for one row, from a control nobody was touching.
+      if (placedRef.current) {
+        placedRef.current = false
+        endDragNotes() // the next menu sounds its first row, wherever it opens
+      }
+      return
+    }
+    if (!placedRef.current) {
+      placedRef.current = true
+      return
+    }
+    if (displayed[activeIndex]) hoverNote(activeIndex, displayed.length)
+  }, [open, activeIndex, displayed])
 
   // A preview must never outlive the menu: revert if this control unmounts (the section
   // collapsed, the selection changed) while one is showing.
@@ -544,6 +579,30 @@ export default function Select<T extends string>({
                   {option.icon != null ? <span className="u-select-icon">{option.icon}</span> : null}
                   <span className="u-select-label">{option.label}</span>
                   {option.marked ? <span className="u-select-dot" aria-hidden="true" /> : null}
+                  {option.action ? (
+                    <button
+                      type="button"
+                      className="u-select-action"
+                      title={option.action.label}
+                      aria-label={option.action.label}
+                      // The listbox owns arrow-key focus; this is reached with the
+                      // pointer (and by name from a screen reader), not by tabbing
+                      // out of the list mid-navigation.
+                      tabIndex={-1}
+                      // The menu closes on an outside pointerdown and picks on click;
+                      // this row is inside it, so only the click needs stopping — and
+                      // it has to stop before `choose` runs, or acting on an option
+                      // would also select it.
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        const run = option.action!.onSelect
+                        cancelMenu()
+                        run()
+                      }}
+                    >
+                      {option.action.icon}
+                    </button>
+                  ) : null}
                 </div>
               )
             })

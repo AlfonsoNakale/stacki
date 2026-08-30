@@ -1,5 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { CheckIcon } from './Icons.jsx';
+import DataPicker from './DataPicker.jsx';
+import { dataTree } from '../dataSuggest.js';
+import { BIND_PATH_RE, resolvePick } from '../bindings.js';
+import { deleteChipAtCaret } from './chipKeys.js';
+import { ElementLinkIcon } from './Icons.jsx';
 
 // Rich inline-content editor for the props panel: a contentEditable field
 // showing a node's inline children (text + <strong>/<em>/<sup>/… tags) with a
@@ -37,11 +41,21 @@ const esc = (s) =>
 
 const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
 
-// `chipOf` is the set of expressions the panel can offer alternatives for.
-// Only those become chips: a chip is atomic and unedittable, so turning a
-// hand-written expression like {index + 1} into one would take away the only
-// way to fix the "+ 1". Anything not in the set stays literal, editable text.
-export function nodesToHtml(nodes, chippable) {
+// Which expressions become chips: a PLAIN PATH does — `{post.data.title}` is
+// one thing, and the way to change it is to choose another, not to retype it
+// character by character. A computed expression stays literal, editable text,
+// because a chip is atomic and turning `{index + 1}` into one would take away
+// the only way to fix the "+ 1". The same rule the prop fields use, so a
+// binding looks the same wherever it appears.
+export function isChippable(inner) {
+  const t = String(inner || '').trim();
+  // `{true}`, `{0}`, `{" "}` — expressions, but nothing is bound in them, and
+  // a chip would take away the only way to change what they say.
+  if (/^(true|false|null|undefined)$/.test(t) || /^[-+]?(\d+\.?\d*|\.\d+)$/.test(t)) return false;
+  return BIND_PATH_RE.test(t);
+}
+
+export function nodesToHtml(nodes, chippable = isChippable) {
   let out = '';
   for (const n of nodes || []) {
     if (n.kind === 'text') {
@@ -52,7 +66,7 @@ export function nodesToHtml(nodes, chippable) {
       // text either side stays editable. The braces live in data-expr; the
       // label reads better without them.
       const inner = n.value.replace(/^\{|\}$/g, '').trim();
-      if (chippable?.has(inner)) {
+      if (chippable(inner)) {
         out += `<span class="expr-chip" contenteditable="false" data-expr="${esc(n.value).replace(
           /"/g,
           '&quot;'
@@ -127,7 +141,7 @@ function domToNodes(el) {
   return out;
 }
 
-export default function RichContent({ nodes, onChange, exprOptions }) {
+const RichContent = function RichContent({ nodes, onChange, bindCtx, insertRef }) {
   const hostRef = useRef(null);
   const bubbleRef = useRef(null);
   const lastEmittedRef = useRef(null);
@@ -139,11 +153,7 @@ export default function RichContent({ nodes, onChange, exprOptions }) {
   const [chipMenu, setChipMenu] = useState(null); // {chip, left, top, current}
   const [linkUrl, setLinkUrl] = useState('');
 
-  const chippable = React.useMemo(
-    () => new Set((exprOptions || []).map((o) => o.insert)),
-    [exprOptions]
-  );
-  const html = nodesToHtml(nodes, chippable);
+  const html = nodesToHtml(nodes, isChippable);
 
   // Load / external updates. lastEmittedRef holds the canonical html of the
   // nodes this editor last emitted, so an incoming value that matches it is
@@ -164,25 +174,47 @@ export default function RichContent({ nodes, onChange, exprOptions }) {
   const emit = () => {
     const el = hostRef.current;
     if (!el) return;
-    const next = domToNodes(el);
+    let next = domToNodes(el);
+    // Deleting the last character leaves a <br> behind: a contentEditable
+    // needs one line for the caret to sit on, so the browser puts a
+    // placeholder there. It isn't content, and writing it out means the
+    // component still receives slot content — a heading emptied in the panel
+    // would keep rendering, holding a line break. A lone <br> is that
+    // placeholder and nothing else, so it clears to nothing.
+    if (next.length === 1 && next[0].kind === 'element' && next[0].name === 'br') next = [];
     // Canonical, not el.innerHTML: the app hands the nodes back with ids
     // added and the browser normalises markup as you type, so only the
     // serialised form is comparable on the way back in.
-    lastEmittedRef.current = nodesToHtml(next, chippable);
+    lastEmittedRef.current = nodesToHtml(next, isChippable);
     onChange(next);
+  };
+
+  // The wrapper of `tag` the whole selection sits inside, or null. Both ends
+  // are resolved down to the node they point AT, rather than reading
+  // sel.anchorNode: a range can select an element from its parent — start
+  // (parent, i), end (parent, i+1) — and that is exactly what surrounding the
+  // selection leaves behind, so asking the anchor (the parent) whether it is
+  // inside `tag` answers no about the tag it just made.
+  const tagAround = (tag) => {
+    const host = hostRef.current;
+    const sel = window.getSelection();
+    if (!host || !sel || sel.rangeCount === 0) return null;
+    const r = sel.getRangeAt(0);
+    const at = (container, offset) => {
+      const n = container.nodeType === 1 ? container.childNodes[offset] || container : container;
+      const el = n.nodeType === 1 ? n : n.parentElement;
+      return el ? el.closest(tag) : null;
+    };
+    // The end boundary points just PAST its node, so step back one.
+    const start = at(r.startContainer, r.startOffset);
+    const end = at(r.endContainer, r.endOffset - (r.endContainer.nodeType === 1 ? 1 : 0));
+    const el = start && start === end ? start : null;
+    return el && host.contains(el) && el !== host ? el : null;
   };
 
   // Formatting state at the current selection, for highlighting buttons.
   const readStates = () => {
-    const el = hostRef.current;
-    const sel = window.getSelection();
-    const anchorEl =
-      sel && sel.anchorNode
-        ? sel.anchorNode.nodeType === 1
-          ? sel.anchorNode
-          : sel.anchorNode.parentElement
-        : null;
-    const inTag = (tag) => !!(anchorEl && el && el.contains(anchorEl) && anchorEl.closest(tag));
+    const inTag = (tag) => !!tagAround(tag);
     let s = {};
     try {
       s = {
@@ -195,9 +227,59 @@ export default function RichContent({ nodes, onChange, exprOptions }) {
       s = {};
     }
     s.code = inTag('code');
+    s.span = inTag('span');
     s.link = inTag('a');
     return s;
   };
+
+  // Where the caret is, saved whenever it is inside the editor. The bubble
+  // below only tracks real selections; inserting data needs the collapsed
+  // caret too, and by the time the picker is open focus has left the editor.
+  const caretRef = useRef(null);
+  useEffect(() => {
+    const onSel = () => {
+      const el = hostRef.current;
+      const sel = window.getSelection();
+      if (!el || !sel?.rangeCount) return;
+      const r = sel.getRangeAt(0);
+      if (el.contains(r.commonAncestorContainer)) caretRef.current = r.cloneRange();
+    };
+    document.addEventListener('selectionchange', onSel);
+    return () => document.removeEventListener('selectionchange', onSel);
+  }, []);
+
+  // Dropping data in from outside — the Content field's own insert button.
+  useEffect(() => {
+    if (!insertRef) return undefined;
+    insertRef.current = {
+      insert(path) {
+        const el = hostRef.current;
+        if (!el) return;
+        el.focus();
+        const sel = window.getSelection();
+        const saved = caretRef.current;
+        const range = document.createRange();
+        if (saved && el.contains(saved.commonAncestorContainer)) {
+          range.setStart(saved.startContainer, saved.startOffset);
+          range.setEnd(saved.endContainer, saved.endOffset);
+        } else {
+          range.selectNodeContents(el);
+          range.collapse(false);
+        }
+        sel.removeAllRanges();
+        sel.addRange(range);
+        document.execCommand(
+          'insertHTML',
+          false,
+          `<span class="expr-chip" contenteditable="false" data-expr="{${path}}">${path}</span>`
+        );
+        emit();
+      },
+    };
+    return () => {
+      insertRef.current = null;
+    };
+  });
 
   // Selection bubble: track selections anchored inside the editor.
   useEffect(() => {
@@ -248,12 +330,29 @@ export default function RichContent({ nodes, onChange, exprOptions }) {
     setPos({ left, top, below, arrowX });
   }, [bubble, linkMode]);
 
+  // Snapshot the live selection as the range the next press restores.
+  // Every action below re-reads it rather than leaving that to the
+  // `selectionchange` listener, because that event is fired from a queued
+  // task: a second press landing in the same task would otherwise act on the
+  // range from before the first one, which by then has been dragged along by
+  // the DOM edit and no longer means what it did. That is how pressing Code
+  // twice quickly used to nest a <code> inside a <code>.
+  const saveSelection = () => {
+    const host = hostRef.current;
+    const sel = window.getSelection();
+    if (!host || !sel || sel.rangeCount === 0) return;
+    const r = sel.getRangeAt(0);
+    if (host.contains(r.commonAncestorContainer)) savedRangeRef.current = r.cloneRange();
+  };
+
   const restoreSelection = () => {
     const r = savedRangeRef.current;
     if (!r) return;
     const sel = window.getSelection();
     sel.removeAllRanges();
-    sel.addRange(r);
+    // A clone: addRange can adopt the very range it is handed, and then
+    // surroundContents below would rewrite the saved one as a side effect.
+    sel.addRange(r.cloneRange());
   };
 
   const exec = (command, value = null) => {
@@ -261,17 +360,51 @@ export default function RichContent({ nodes, onChange, exprOptions }) {
     restoreSelection();
     document.execCommand(command, false, value);
     emit();
+    saveSelection();
     setStates(readStates());
   };
 
-  // No execCommand for <code> — wrap the selection manually.
-  const wrapCode = () => {
+  // Take the selection out of the nearest `tag` around it, leaving its text
+  // where it was. The button is a toggle — pressing one that is already lit has
+  // to turn it off, and for a <span> that is the only way back: a span with no
+  // attributes on it yet is invisible, so one added by mistake could otherwise
+  // only be removed by editing the file.
+  const unwrapTag = (tag) => {
+    const sel = window.getSelection();
+    const el = tagAround(tag);
+    if (!el) return false;
+    const parent = el.parentNode;
+    const first = el.firstChild;
+    const last = el.lastChild;
+    while (el.firstChild) parent.insertBefore(el.firstChild, el);
+    parent.removeChild(el);
+    // Keep the text selected, so the bubble stays up and the next press acts on
+    // the same words.
+    if (first && last) {
+      const r = document.createRange();
+      r.setStartBefore(first);
+      r.setEndAfter(last);
+      sel.removeAllRanges();
+      sel.addRange(r);
+    }
+    return true;
+  };
+
+  // No execCommand for <code> or <span> — wrap the selection manually.
+  const wrapTag = (tag) => {
     hostRef.current?.focus();
     restoreSelection();
+    // Already inside one: the press means "stop".
+    if (unwrapTag(tag)) {
+      emit();
+      saveSelection();
+      setStates(readStates());
+      return;
+    }
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
     const range = sel.getRangeAt(0);
-    const el = document.createElement('code');
+    const el = document.createElement(tag);
     try {
       range.surroundContents(el);
     } catch {
@@ -284,6 +417,7 @@ export default function RichContent({ nodes, onChange, exprOptions }) {
     r.selectNodeContents(el);
     sel.addRange(r);
     emit();
+    saveSelection();
     setStates(readStates());
   };
 
@@ -296,6 +430,7 @@ export default function RichContent({ nodes, onChange, exprOptions }) {
     restoreSelection();
     document.execCommand('createLink', false, url);
     emit();
+    saveSelection();
     setStates(readStates());
   };
 
@@ -347,7 +482,7 @@ export default function RichContent({ nodes, onChange, exprOptions }) {
       // very mousedown that opened the menu is still propagating to document.
       // Without the exclusion the menu closes on the click that opened it —
       // and clicking straight from one chip to another would too.
-      if (e.target.closest?.(".expr-menu, .expr-chip")) return;
+      if (e.target.closest?.(".bind-menu, .expr-chip")) return;
       setChipMenu(null);
     };
     const onKey = (e) => e.key === "Escape" && setChipMenu(null);
@@ -378,33 +513,29 @@ export default function RichContent({ nodes, onChange, exprOptions }) {
             e.preventDefault();
             document.execCommand('insertHTML', false, '<br>');
             emit();
+            return;
+          }
+          // Backspace against a chip takes that chip, and only that chip —
+          // not the sentence it sits in.
+          if (deleteChipAtCaret(hostRef.current, e)) {
+            e.preventDefault();
+            emit();
           }
         }}
       />
       {chipMenu && (
         <div
-          className="dd-popup expr-menu"
-          style={{ left: chipMenu.left, top: chipMenu.top, width: 220 }}
+          className="dd-popup bind-menu"
+          style={{ left: chipMenu.left, top: chipMenu.top, width: 260 }}
         >
-          {(exprOptions || []).map((o) => (
-            <div
-              key={o.insert}
-              className={`dd-option ${o.insert === chipMenu.current ? "selected" : ""}`}
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => pickExpr(o.insert)}
-            >
-              <span className="dd-check">
-                {o.insert === chipMenu.current ? <CheckIcon size={11} /> : null}
-              </span>
-              <span className="dd-option-label">{o.insert}</span>
-              {o.hint && <span className="dd-hint">{o.hint}</span>}
-            </div>
-          ))}
-          {(exprOptions || []).length === 0 && (
-            <div className="dd-option dim">
-              <span className="dd-option-label">Nothing else in scope</span>
-            </div>
-          )}
+          <DataPicker
+            tree={dataTree(bindCtx || {})}
+            current={chipMenu.current}
+            entries={bindCtx?.entryNav}
+            onPick={(path, query) => pickExpr(resolvePick(path, query, bindCtx))}
+            onExpand={(node) => node.query && bindCtx?.onNeedSample?.(node.query.collection)}
+            footer={false}
+          />
         </div>
       )}
       {bubble && (
@@ -454,12 +585,21 @@ export default function RichContent({ nodes, onChange, exprOptions }) {
                 () => exec('subscript'),
                 states.subscript
               )}
-              {btn(<span className="mono">{'</>'}</span>, 'Code', wrapCode, states.code)}
-              {btn('🔗', 'Link', () => setLinkMode(true), states.link)}
+              {btn(<span className="mono">{'</>'}</span>, 'Code', () => wrapTag('code'), states.code)}
+              {/* A span is the hook for everything else: wrap some words, then
+                  give that node a class and style it like any other. Nothing is
+                  written on it here — an empty span IS the useful result. */}
+              {btn(<span className="mono">span</span>, 'Wrap in a span', () => wrapTag('span'), states.span)}
+              {/* The app's own link icon, not the emoji: an emoji is drawn by
+                  the system in its own colours and at its own weight, so it sat
+                  in this row as the one thing that hadn't been designed. */}
+              {btn(<ElementLinkIcon size={14} />, 'Link', () => setLinkMode(true), states.link)}
             </>
           )}
         </div>
       )}
     </>
   );
-}
+};
+
+export default RichContent;

@@ -3,16 +3,20 @@ import { createPortal } from 'react-dom'
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from 'react'
 import { CodeEditor } from './components/CodeEditor'
 import FieldLabel from './components/FieldLabel'
+import { PropTip, ProvenanceLabel } from './components/PropTip'
 import Select, { type SelectOption } from './components/Select'
 import SegmentedControl, { type SegmentedOption } from './components/SegmentedControl'
-import DisplayControl from './DisplayControl'
+import useScrub from './components/useScrub'
+import DisplayControl, { DISPLAY_VALUES } from './DisplayControl'
 import DirectionControl from './DirectionControl'
 import AlignControl from './AlignControl'
 import ElementTokenPicker from './ElementTokenPicker'
 import { loadEmbedSource, saveEmbedSource } from './shared/tool-prefs'
 import { handleArrowStep } from './lib/number-step'
 import { hslaToRgba } from './lib/color'
-import { filterCssProperties } from './lib/css-properties'
+import { clampNonNegative, filterCssProperties } from './lib/css-properties'
+import { panelSpan } from './lib/panel-box'
+import { forgetComputedStyles, useHighlight } from './lib/computed-style'
 import SizeSection from './SizeSection'
 import GapControl from './GapControl'
 import GridControls from './GridControls'
@@ -27,7 +31,7 @@ import ProvenanceList, { ProvenanceEmbedNav } from './ProvenanceList'
 import VariableConnect from './VariableConnect'
 import { computeRuleModel, type DeclStatus, type MatchedRule, type RuleModel } from './lib/cascade'
 import { groupDeclarations, groupProps } from './lib/sections'
-import { selectorToClassTokens, snapshotTokens, tokensToSelector } from './lib/element-tokens'
+import { defaultSelectorTokens, selectorToClassTokens, snapshotTokens, tokensToSelector } from './lib/element-tokens'
 import { resolveStyle, indexContexts, contextKeyOf, listMatchedSelectors, selectorKey, selectorsMatch, stateForSelector, STATES, type ContextInfo, type ContextKey, type MatchedSelector, type ResolvedProp, type ResolvedStyle, type SourceKey, type StateKey, type StyleContext } from './lib/resolved'
 import { breakpointTier, buildStyleContexts, mediaParamsForBreakpoint, nativeContribsFor, nativeHasValues, nativeSelectorChips, optionsFor, selectedNativeIndexFor, type NativeStyleOptions } from './lib/native-styles'
 import type { AtRule, Declaration } from 'postcss'
@@ -48,12 +52,17 @@ import {
   removeDeclaration,
   removeRule,
   removeRuleIfEmpty,
+  renameAtRuleQuery,
+  atRuleQueryText,
+  queryKey,
+  splitQuery,
   reorderDeclarations,
   replaceRuleCss,
   setDeclarationValue,
   splitRuleSelectorAt,
 } from './lib/css'
 import { canonicalCompound, compareSpecificity, formatSpecificity, parseSelectorList, type MatchTarget } from './lib/selectors'
+import { findNode, getHost, onHostChange, propText } from './lib/host'
 import {
   applyNativePropertyAt,
   applyNativeToNewBaseClass,
@@ -65,9 +74,12 @@ import {
   navigateToEmbed,
   readNativeStyleByName,
   readNativeStyles,
+  onDocsReloaded,
   rebuildRules,
   removeNativePropertyAt,
   resolveIdentityElement,
+  askCanvasAbout,
+  primeDomMatches,
   resolveTarget,
   scanAllComponents,
   scanHasElement,
@@ -84,6 +96,7 @@ import {
 } from './lib/webflow'
 import type { BreakpointId, ElementSnapshot, NativeModel, ParsedDeclaration, ParsedRule, Specificity } from './lib/types'
 import './embed-editor.css'
+import { splitTopLevelSpaces } from './lib/background'
 
 type ScanState = {
   rootSnapshot: ElementSnapshot | undefined
@@ -120,13 +133,16 @@ function parseImportant(input: string): { value: string; important: boolean } {
 
 function headerLabel(snapshot: ElementSnapshot | undefined): string {
   if (!snapshot) return 'None'
-  const tag = snapshot.tag ?? snapshot.webflowType.toLowerCase()
   const id = snapshot.id ? `#${snapshot.id}` : ''
   // Show classes in their Webflow CSS form, de-duplicated (the snapshot keeps the raw
   // display name too — e.g. `Div Block` alongside `div-block` — for matching).
   const formatted = [...new Set(snapshot.classes.map(webflowClassToCss).filter(Boolean))]
   const classes = formatted.length ? `.${formatted.slice(0, 5).join('.')}` : ''
-  return `${tag}${id}${classes}` || tag
+  // This line reads as a selector, so it only shows what really is one. A
+  // component instance has no tag; writing its kind there would spell
+  // `component.card`, implying a `<component>` element exists.
+  const tag = snapshot.tag ?? ''
+  return `${tag}${id}${classes}` || snapshot.webflowType || 'Element'
 }
 
 // A selector Webflow can represent as one base class without an element carrying it.
@@ -355,13 +371,14 @@ const ValueField = forwardRef<HTMLTextAreaElement, {
   const cancelLive = () => {
     if (liveTimer.current != null) { window.clearTimeout(liveTimer.current); liveTimer.current = null }
   }
+  // Undelayed live write for the scrub, which throttles its own — see useScrub.
+  const liveNow = (text: string) => {
+    const parsed = parseImportant(text)
+    if (parsed.value) onLiveCommit(parsed.value, parsed.important)
+  }
   const scheduleLive = (text: string) => {
     cancelLive()
-    liveTimer.current = window.setTimeout(() => {
-      liveTimer.current = null
-      const parsed = parseImportant(text)
-      if (parsed.value) onLiveCommit(parsed.value, parsed.important)
-    }, 100)
+    liveTimer.current = window.setTimeout(() => { liveTimer.current = null; liveNow(text) }, 100)
   }
   useEffect(() => cancelLive, [])
 
@@ -384,15 +401,24 @@ const ValueField = forwardRef<HTMLTextAreaElement, {
     }
   }, [expanded, draft])
 
-  const commit = () => {
-    const parsed = parseImportant(draft)
+  const commit = (text = draft) => {
+    const parsed = parseImportant(text)
     if (parsed.value && (parsed.value !== value || parsed.important !== important)) {
       onCommit(parsed.value, parsed.important)
     }
   }
 
+  const scrub = useScrub({
+    value: draft,
+    disabled: busy,
+    onPreview: setDraft,
+    onInput: liveNow,
+    onCommit: (text) => { setDraft(text); commit(text) },
+  })
+
   return (
     <textarea
+      {...scrub.input}
       ref={attachRef}
       data-prop={dataProp}
       className={`u-input embed-editor_value-input ${expanded ? 'is-expanded' : 'is-collapsed'}`}
@@ -538,13 +564,15 @@ function PropertyCombobox({ value, busy, onChange, onPick, onEnter, onEscape }: 
   useEffect(() => { setActive(0) }, [value])
 
   // Position the list vertically against the input (above it, flipping below only when
-  // there's more room there); span the FULL panel width — left:0/right:0 — like the
-  // variable picker, so long property names aren't truncated in the input's narrow column.
+  // there's more room there); span the full panel width, like the variable picker, so
+  // long property names aren't truncated in the input's narrow column. The panel is
+  // measured — it's a column of the window here, not the window itself.
   useLayoutEffect(() => {
     if (!open) return
     const input = inputRef.current
     if (!input) return
     const r = input.getBoundingClientRect()
+    const span = panelSpan(input)
     const margin = 8
     const gap = 4
     const spaceAbove = r.top - margin
@@ -552,8 +580,8 @@ function PropertyCombobox({ value, busy, onChange, onPick, onEnter, onEscape }: 
     const up = spaceAbove >= spaceBelow
     const maxHeight = Math.max(120, Math.min(340, (up ? spaceAbove : spaceBelow) - gap))
     setPos(up
-      ? { position: 'fixed', left: 0, right: 0, bottom: window.innerHeight - r.top + gap, maxHeight, visibility: 'visible' }
-      : { position: 'fixed', left: 0, right: 0, top: r.bottom + gap, maxHeight, visibility: 'visible' })
+      ? { position: 'fixed', left: span.left, width: span.width, bottom: window.innerHeight - r.top + gap, maxHeight, visibility: 'visible' }
+      : { position: 'fixed', left: span.left, width: span.width, top: r.bottom + gap, maxHeight, visibility: 'visible' })
   }, [open, matches.length, value])
 
   // Keep the highlighted option scrolled into view during keyboard nav.
@@ -678,7 +706,7 @@ function AddPropertyRow({ busy, onAdd }: { busy: boolean; onAdd: (prop: string, 
 
 // A collapsible section header (Webflow's chevron + label) wrapping a group of
 // controls. Open by default; collapse state is local to the block.
-function SectionBlock({ label, headerAction, defaultOpen = true, children }: { label: string; headerAction?: ReactNode; defaultOpen?: boolean; children: ReactNode }) {
+function SectionBlock({ label, headerAction, defaultOpen = true, mark = null, children }: { label: string; headerAction?: ReactNode; defaultOpen?: boolean; mark?: 'own' | 'other' | null; children: ReactNode }) {
   const [open, setOpen] = useState(defaultOpen)
   const toggle = () => setOpen((value) => !value)
   return (
@@ -690,6 +718,20 @@ function SectionBlock({ label, headerAction, defaultOpen = true, children }: { l
           <span className="embed-editor_section-title">{label}</span>
         </button>
         {headerAction}
+        {/* Only while closed, and beside the chevron rather than the label, so the
+            right edge of every header reads as one column: what is in here, then
+            open/closed. Open, the property labels inside are already saying it in
+            these same two colours — orange for anything reaching the element at
+            all, blue once the picked selector is one of the things setting it —
+            and the dot would only be repeating them. */}
+        {!open && mark ? (
+          <span
+            className={`embed-editor_section-dot ${mark === 'own' ? 'is-own' : ''}`}
+            role="img"
+            aria-label={mark === 'own' ? `${label} has styles on this selector` : `${label} has styles from another selector`}
+            title={mark === 'own' ? 'Set on this selector' : 'Set on another selector'}
+          />
+        ) : null}
         <button
           type="button"
           className="embed-editor_section-chevron-btn"
@@ -724,10 +766,13 @@ function ProvenancePopover({ prop, anchor, resolved, onClose, onAnchorReclick, o
     if (!el) return
     const margin = 8
     const { width, height } = el.getBoundingClientRect()
+    // Horizontally the popover belongs to the panel, not the window — clamping
+    // to the viewport would let it hang off the panel's left edge.
+    const span = panelSpan(el)
     let left = anchor.left
     let top = anchor.bottom + 6
-    if (left + width > window.innerWidth - margin) left = window.innerWidth - margin - width
-    if (left < margin) left = margin
+    if (left + width > span.left + span.width) left = span.left + span.width - width
+    if (left < span.left) left = span.left
     if (top + height > window.innerHeight - margin) {
       const above = anchor.top - 6 - height
       top = above >= margin ? above : Math.max(margin, window.innerHeight - margin - height)
@@ -845,8 +890,10 @@ function ResolvedRow({ prop, resolved, busy, setProp, clearProp, liveSetProp, on
 }
 
 // The Display control is always shown (Webflow parity), even when no selector
-// sets `display`. In that case we assume the browser default (block) so there's
-// always a value to edit; the label stays dim to signal it isn't set yet.
+// sets `display`. In that case it shows what the PAGE computes for the element —
+// a `<span>` reads inline, a flex child of a component-authored rule reads what
+// that rule says — falling back to `block` when there's no canvas to ask. The
+// label stays dim either way, to signal it isn't set here.
 function DisplayRow({ resolved, busy, setProp, clearProp, onProvenance, onSelectSelector }: {
   resolved: ResolvedProp | undefined
   busy: boolean
@@ -856,13 +903,16 @@ function DisplayRow({ resolved, busy, setProp, clearProp, onProvenance, onSelect
   onSelectSelector: (selector: string, prop?: string) => void
 }) {
   const isSelected = resolved?.source === 'selected'
+  // Nothing declared → what the page renders as, held steady while it is asked
+  // rather than guessed at (see useHighlight).
+  const shown = useHighlight('', resolved ? '' : 'display', DISPLAY_VALUES, 'block')
   const current = resolved
     ? (isSelected && resolved.selectedValue ? resolved.selectedValue : { value: resolved.winner.value, important: resolved.winner.important })
-    : { value: 'block', important: false }
+    : { value: shown, important: false }
   return (
     <div className="embed-editor_size-row">
       {!resolved ? (
-        <FieldLabel className="embed-editor_size-label" active={false} disabled={busy} onReset={() => {}}>Display</FieldLabel>
+        <FieldLabel className="embed-editor_size-label" active={false} disabled={busy} onReset={() => {}} tooltip={<PropTip props={['display']} />}>Display</FieldLabel>
       ) : isSelected ? (
         <FieldLabel
           className="embed-editor_size-label"
@@ -870,20 +920,19 @@ function DisplayRow({ resolved, busy, setProp, clearProp, onProvenance, onSelect
           disabled={busy}
           onReset={() => clearProp('display')}
           resetLabel="Remove property"
+          tooltip={<PropTip props={['display']} />}
           menuNote={(close) => <ProvenanceList contributors={resolved.contributors} prop="display" onSelect={(sel, p) => { onSelectSelector(sel, p); close() }} />}
         >
           Display
         </FieldLabel>
       ) : (
-        <button
-          type="button"
-          className="embed-editor_size-label embed-editor_prop-orange"
-          disabled={busy}
-          title={`Set by ${resolved.winner.selectorText} — click to see all selectors`}
-          onClick={(event) => onProvenance('display', event.currentTarget.getBoundingClientRect())}
-        >
-          Display
-        </button>
+        <ProvenanceLabel
+          label="Display"
+          props={['display']}
+          busy={busy}
+          onProvenance={onProvenance}
+          note={`Set by ${resolved.winner.selectorText} — click to see all selectors`}
+        />
       )}
       <DisplayControl value={current.value} important={current.important} busy={busy} onCommit={(value, important) => setProp('display', value, important)} />
     </div>
@@ -937,7 +986,7 @@ function VerticalAlignRow({ resolved, dimmed, busy, setProp, clearProp, onProven
       title={dimmed ? 'Align Y applies when Display is inline or table-cell' : undefined}
     >
       {!resolved ? (
-        <FieldLabel className="embed-editor_size-label" active={false} disabled={busy} onReset={() => {}}>Align Y</FieldLabel>
+        <FieldLabel className="embed-editor_size-label" active={false} disabled={busy} onReset={() => {}} tooltip={<PropTip props={[prop]} />}>Align Y</FieldLabel>
       ) : isSelected ? (
         <FieldLabel
           className={`embed-editor_size-label ${overridden ? 'is-overridden' : ''}`}
@@ -945,21 +994,20 @@ function VerticalAlignRow({ resolved, dimmed, busy, setProp, clearProp, onProven
           disabled={busy}
           onReset={() => clearProp(prop)}
           resetLabel="Remove property"
+          tooltip={<PropTip props={[prop]} />}
           title={overridden ? `Overridden by ${resolved.winner.selectorText}` : undefined}
           menuNote={(close) => <ProvenanceList contributors={resolved.contributors} prop={prop} onSelect={(sel, p) => { onSelectSelector(sel, p); close() }} />}
         >
           Align Y
         </FieldLabel>
       ) : (
-        <button
-          type="button"
-          className="embed-editor_size-label embed-editor_prop-orange"
-          disabled={busy}
-          title={`Set by ${resolved.winner.selectorText} — click to see all selectors`}
-          onClick={(event) => onProvenance(prop, event.currentTarget.getBoundingClientRect())}
-        >
-          Align Y
-        </button>
+        <ProvenanceLabel
+          label="Align Y"
+          props={[prop]}
+          busy={busy}
+          onProvenance={onProvenance}
+          note={`Set by ${resolved.winner.selectorText} — click to see all selectors`}
+        />
       )}
       <Select
         value={matched ?? (raw || 'baseline')}
@@ -1006,7 +1054,7 @@ const FLEX_WRAPS = ['nowrap', 'wrap', 'wrap-reverse']
 function currentFlexFlow(read: (prop: string) => ResolvedProp | undefined): string {
   let direction = 'row'
   let wrap = 'nowrap'
-  const flowTokens = effectiveValue(read('flex-flow')).split(/\s+/)
+  const flowTokens = splitTopLevelSpaces(effectiveValue(read('flex-flow')))
   const dir = effectiveValue(read('flex-direction'))
   const wr = effectiveValue(read('flex-wrap'))
   if (FLEX_DIRECTIONS.includes(dir)) direction = dir
@@ -1098,7 +1146,8 @@ function DirectionRow({ read, busy, setProp, clearProp, onProvenance, onSelectSe
 
 // The flex Align control — only rendered when `display` is flex. Its X / Y dropdowns
 // write `justify-content` / `align-items` (mapped to the screen axis via the current
-// flex-direction); the combined "Align" label clears both.
+// flex-direction), and each carries its own clearable label so the two axes reset
+// independently; the row's "Align" caption is inert.
 const ALIGN_PROPS = new Set(['justify-content', 'align-items'])
 // Grid props owned by the dedicated GridControls block (and the "Configure grid"
 // panel) — kept out of the generic fall-through rows when the element is a grid
@@ -1121,23 +1170,19 @@ function AlignRow({ read, busy, setProp, clearProp, liveSetProp, onProvenance, o
   const column = currentFlexFlow(read).startsWith('column')
   return (
     <div className="embed-editor_size-row embed-editor_align-row">
-      <GroupLabel
-        label="Align"
-        props={['justify-content', 'align-items']}
-        read={read}
-        busy={busy}
-        onClear={() => clearProp(['justify-content', 'align-items'])}
-        onProvenance={onProvenance}
-        onSelectSelector={onSelectSelector}
-      />
+      {/* Inert caption — the X / Y labels own clear / provenance per axis. */}
+      <FieldLabel className="embed-editor_size-label" active={false} disabled={busy} onReset={() => {}} tooltip={<PropTip props={['justify-content', 'align-items']} />}>Align</FieldLabel>
       <AlignControl
         justify={effectiveValue(read('justify-content'))}
         align={effectiveValue(read('align-items'))}
         column={column}
         busy={busy}
+        read={read}
         onSet={(prop, value) => setProp(prop, value, false)}
         onLive={(prop, value) => liveSetProp(prop, value, false)}
         onClear={(prop) => clearProp(prop)}
+        onProvenance={onProvenance}
+        onSelectSelector={onSelectSelector}
       />
     </div>
   )
@@ -1254,8 +1299,38 @@ type SourceOption = {
 // its tag, each class, each data attribute (presence then valued), and its combo
 // class chains.
 type SelectorSuggestion = { selector: string; kind: 'tag' | 'class' | 'attribute' | 'attribute-value' | 'combo' }
+
+// Every class in the project, kept in step with the app (the same list the Settings
+// panel's class field autocompletes from).
+function useProjectClasses(): string[] {
+  const [list, setList] = useState<string[]>(() => getHost().projectClasses ?? [])
+  useEffect(() => {
+    const sync = () => setList((prev) => {
+      const next = getHost().projectClasses ?? []
+      return next.length === prev.length && next.every((c, i) => c === prev[i]) ? prev : next
+    })
+    sync()
+    return onHostChange(sync)
+  }, [])
+  return list
+}
+// How many project-wide classes the suggestion list will show for one query — enough
+// to pick from, few enough that the list stays a list.
+const PROJECT_CLASS_LIMIT = 30
+
 const SUGGESTION_KIND_LABEL: Record<SelectorSuggestion['kind'], string> = {
   tag: 'tag', class: 'class', attribute: 'attribute', 'attribute-value': 'attribute', combo: 'combo',
+}
+
+// A selector that says nothing about *this* element — `:target`, `:focus-visible`,
+// `*`, `::selection`, `body > *`. They match almost everything on the page, so a
+// project with a couple of them tacks them onto every element's chip list and
+// buries the selectors that actually describe what's selected. Kept behind a
+// toggle instead. A class, id or attribute anywhere in the selector (including
+// inside `:is(...)`) makes it specific enough to show.
+function isGlobalSelector(text: string): boolean {
+  if (/[.#[]/.test(text)) return false
+  return canonicalCompound(text).tokens.length === 0
 }
 
 // The selector picker: a chip per selector that styles the element (its own
@@ -1265,11 +1340,16 @@ const SUGGESTION_KIND_LABEL: Record<SelectorSuggestion['kind'], string> = {
 // input offers an autocomplete list of the element's targetable selectors:
 // ↑/↓ move, Enter applies the highlighted one (or the typed text), Tab fills it
 // into the input to keep typing.
-function SelectorPicker({ selectors, suggestions, activeSelector, busy, onSelect, onDeselect, onAdd }: {
+export function SelectorPicker({ selectors, suggestions, activeSelector, activePicked, busy, loading, onSelect, onDeselect, onAdd }: {
   selectors: MatchedSelector[]
   suggestions: SelectorSuggestion[]
   activeSelector: string
+  /** True when the active selector is one the user clicked or typed, rather than
+   *  the panel's auto-composed default. */
+  activePicked: boolean
   busy: boolean
+  /** Still scanning — the chips that will fill this well are on their way. */
+  loading: boolean
   onSelect: (selector: string) => void
   onDeselect: () => void
   onAdd: (selector: string) => void
@@ -1278,6 +1358,7 @@ function SelectorPicker({ selectors, suggestions, activeSelector, busy, onSelect
   const [open, setOpen] = useState(false)
   const [highlight, setHighlight] = useState(-1)
   const [inputOpen, setInputOpen] = useState(false)
+  const [showGlobals, setShowGlobals] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const wantFocus = useRef(false)
@@ -1290,11 +1371,50 @@ function SelectorPicker({ selectors, suggestions, activeSelector, busy, onSelect
   // as just the black well (with its min-height) rather than an add-selector field.
   const showInput = inputOpen
 
-  const q = draft.trim().toLowerCase()
-  const filtered = useMemo(
-    () => suggestions.filter((s) => !q || s.selector.toLowerCase().includes(q)),
-    [suggestions, q],
+  // Global selectors are folded away behind a count chip. The one exception is a
+  // global the user PICKED — it has to stay on screen for the panel below it to
+  // make sense. A global that is merely the current default target stays hidden,
+  // so the checkbox means what it says.
+  const globals = useMemo(() => selectors.filter((sel) => isGlobalSelector(sel.text)), [selectors])
+  const shownSelectors = useMemo(
+    () =>
+      showGlobals
+        ? selectors
+        : selectors.filter(
+            (sel) =>
+              !isGlobalSelector(sel.text) ||
+              (activePicked && selectorsMatch(sel.text, activeSelector)),
+          ),
+    [selectors, showGlobals, activeSelector, activePicked],
   )
+
+  const projectClasses = useProjectClasses()
+  const q = draft.trim().toLowerCase()
+  // The element's own tokens first — they're what you're usually reaching for — then,
+  // once you've typed something, every other class in the project (the Settings
+  // panel's list), so styling a class this element doesn't carry yet is a matter of
+  // typing its first letters. They're held back while the box is empty: a project's
+  // whole class list would bury the handful that describe this element.
+  // Selectors already in the well aren't suggestions — picking one would just be the
+  // chip that's already sitting above the input.
+  const chipKeys = useMemo(() => new Set(selectors.map((sel) => selectorKey(sel.text))), [selectors])
+  const filtered = useMemo(() => {
+    const own = suggestions.filter(
+      (s) => (!q || s.selector.toLowerCase().includes(q)) && !chipKeys.has(selectorKey(s.selector)),
+    )
+    if (!q) return own
+    const taken = new Set(own.map((s) => s.selector))
+    const extra: SelectorSuggestion[] = []
+    for (const cls of projectClasses) {
+      const selector = `.${cls}`
+      if (taken.has(selector) || chipKeys.has(selectorKey(selector))) continue
+      if (!cls.toLowerCase().includes(q.replace(/^\./, ''))) continue
+      taken.add(selector)
+      extra.push({ selector, kind: 'class' })
+      if (extra.length >= PROJECT_CLASS_LIMIT) break
+    }
+    return [...own, ...extra]
+  }, [suggestions, projectClasses, q, chipKeys])
   const showList = open && filtered.length > 0
 
   // Keep the highlighted row visible while arrowing through a long list.
@@ -1355,13 +1475,25 @@ function SelectorPicker({ selectors, suggestions, activeSelector, busy, onSelect
   }
 
   return (
+    <>
     <div className="embed-editor_selectors">
       {/* One grey well wraps the selector tags; clicking empty space reveals the add
           input at its bottom (the input has no chrome of its own). */}
       <div className="embed-editor_selector-well" onMouseDown={onWellMouseDown}>
-        {selectors.length ? (
+        {/* Nothing to show yet and the scan still running: the well would read as
+            "this element has no selectors", which is a different (and wrong) answer
+            than "not counted yet". A spinner where the first chip will land says
+            which one it is, and holds the box's height so nothing jumps when the
+            chips arrive. */}
+        {loading && !shownSelectors.length ? (
+          <div className="embed-editor_selector-loading" aria-live="polite">
+            <SpinnerIcon />
+            <span className="u-sr-only">Finding the selectors that style this element…</span>
+          </div>
+        ) : null}
+        {shownSelectors.length ? (
           <div className="embed-editor_selector-chips">
-            {selectors.map((sel) => {
+            {shownSelectors.map((sel) => {
               const active = selectorsMatch(sel.text, activeSelector)
               const dimmed = sel.inContext === false
               // Nested rules show their nesting (`.hero { .title }`); selection/matching
@@ -1399,11 +1531,15 @@ function SelectorPicker({ selectors, suggestions, activeSelector, busy, onSelect
               // selector, so the panel drops back to showing all winners read-only. Stash
               // the previously-active selector to restore if you leave without adding one.
               onFocus={() => { restoreRef.current = activeSelector || null; onDeselect(); setOpen(true) }}
-              // On blur: collapse the empty input, and if no new selector was added,
-              // re-select whatever was active before (rather than leaving it deselected).
+              // On blur the half-typed selector is abandoned: clicking away from it is
+              // not a way of adding one (Enter and the suggestion list are), and text
+              // left sitting in a collapsed-looking field reads as applied. Clear it,
+              // collapse the input, and re-select whatever was active before focus.
               onBlur={() => {
                 setOpen(false)
-                if (!draft.trim()) setInputOpen(false)
+                setDraft('')
+                setHighlight(-1)
+                setInputOpen(false)
                 if (restoreRef.current) { onSelect(restoreRef.current); restoreRef.current = null }
               }}
               onChange={(event) => { setDraft(event.target.value); setOpen(true); setHighlight(-1) }}
@@ -1434,7 +1570,32 @@ function SelectorPicker({ selectors, suggestions, activeSelector, busy, onSelect
         ) : null}
       </div>
     </div>
+    {/* Outside the well's box — a view option, not one of the selectors. Always
+        here, even with none to show: appearing when the scan lands moved everything
+        under it down a row, so the panel rearranged itself under the pointer just as
+        it became usable. With nothing to reveal it sits inert instead. */}
+    <label
+      className={`embed-editor_check embed-editor_globals-check ${globals.length ? '' : 'is-empty'}`}
+      title="Selectors like :target, :focus-visible and * match nearly every element on the page"
+    >
+      <input
+        type="checkbox"
+        checked={showGlobals && globals.length > 0}
+        disabled={busy || !globals.length}
+        onChange={(event) => setShowGlobals(event.target.checked)}
+      />
+      <span>Show global selectors ({globals.length})</span>
+    </label>
+    </>
   )
+}
+
+// What somebody typed, as a query. A bare condition is the common shorthand and
+// means @media — `(width < 40em)` and `width < 40em` both do.
+function asQuery(raw: string): string {
+  const trimmed = raw.trim()
+  if (trimmed.startsWith('@')) return trimmed
+  return trimmed.startsWith('(') ? `@media ${trimmed}` : `@media (${trimmed})`
 }
 
 // Sentinel option value for the "Add query" row in the context dropdown — a real
@@ -1476,43 +1637,53 @@ const COMMON_QUERIES: QuerySuggestion[] = [
   { query: '@supports (display: grid)', kind: 'supports' },
 ]
 
-// Inline form to add a custom query (@media/@container/@supports) to the current
-// selector, choosing whether it WRAPS the selector (a new at-rule block) or NESTS
-// inside the selector's existing rule (CSS nesting). Nesting needs a picked selector.
-// The controls sit ABOVE the input so the suggestion list (opened below it) can't
-// cover them; the input pre-fills `@` and offers project + common queries.
-function AddQueryForm({ canNest, suggestions, onAdd, onCancel }: {
-  canNest: boolean
-  suggestions: QuerySuggestion[]
-  onAdd: (query: string, mode: 'wrap' | 'nest') => void
+// A query field: type anything, with every query in the project (and a curated set
+// of common ones) offered underneath. Free text is the point — the list is a
+// shortcut, never a menu of the only allowed answers — so submitting takes what
+// is typed unless a suggestion is explicitly highlighted.
+function QueryCombo({ draft, setDraft, onSubmit, onCancel, suggestions, ariaLabel, initial = '', selectOnFocus = false }: {
+  draft: string
+  setDraft: (next: string) => void
+  onSubmit: (query: string) => void
   onCancel: () => void
+  suggestions: QuerySuggestion[]
+  ariaLabel: string
+  /** The query the field opened on, if it opened on one — a whole query rather
+   *  than the start of one being typed. */
+  initial?: string
+  /** Select the whole value on mount (editing) instead of parking the caret at
+   *  the end of it (adding, where the value so far is just `@`). */
+  selectOnFocus?: boolean
 }) {
-  const [draft, setDraft] = useState('@')
-  const [mode, setMode] = useState<'wrap' | 'nest'>('nest')
   const [open, setOpen] = useState(true)
   const [highlight, setHighlight] = useState(-1)
   const inputRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
-  // Focus with the caret after the pre-filled `@`.
   useEffect(() => {
     const el = inputRef.current
     if (!el) return
     el.focus()
-    el.setSelectionRange(el.value.length, el.value.length)
-  }, [])
+    if (selectOnFocus) el.select()
+    else el.setSelectionRange(el.value.length, el.value.length)
+  }, [selectOnFocus])
 
   const q = draft.trim().toLowerCase()
-  const filtered = useMemo(
-    () => suggestions.filter((s) => !q || q === '@' || s.query.toLowerCase().includes(q)),
-    [suggestions, q],
-  )
+  // Filtering is for narrowing a query being typed. A field holding a WHOLE query
+  // — the one being renamed, or a suggestion just picked — has nothing left to
+  // narrow: matching it against itself leaves a list of one, hiding the very
+  // queries you opened the field to switch to. So a complete query shows them all.
+  const filtered = useMemo(() => {
+    const whole = q === initial.trim().toLowerCase() || suggestions.some((s) => s.query.toLowerCase() === q)
+    if (!q || q === '@' || whole) return suggestions
+    return suggestions.filter((s) => s.query.toLowerCase().includes(q))
+  }, [suggestions, q, initial])
   const showList = open && filtered.length > 0
   useEffect(() => {
     if (!showList || highlight < 0) return
     ;(listRef.current?.children[highlight] as HTMLElement | undefined)?.scrollIntoView({ block: 'nearest' })
   }, [highlight, showList])
 
-  const submit = (text: string) => { const t = text.trim(); if (t && t !== '@') onAdd(t, canNest ? mode : 'wrap') }
+  const submit = (text: string) => { const t = text.trim(); if (t && t !== '@') onSubmit(t) }
   const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     if (event.key === 'ArrowDown') {
       event.preventDefault(); setOpen(true); setHighlight((h) => Math.min(h + 1, filtered.length - 1))
@@ -1530,6 +1701,61 @@ function AddQueryForm({ canNest, suggestions, onAdd, onCancel }: {
       else onCancel()
     }
   }
+
+  return (
+    <div className="embed-editor_add-query-field">
+      <input
+        ref={inputRef}
+        className="u-input embed-editor_add-query-input"
+        value={draft}
+        placeholder="@media (width < 50em)"
+        spellCheck={false}
+        role="combobox"
+        aria-expanded={showList}
+        aria-autocomplete="list"
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onChange={(event) => { setDraft(event.target.value); setOpen(true); setHighlight(-1) }}
+        onKeyDown={onKeyDown}
+        aria-label={ariaLabel}
+      />
+      {showList ? (
+        <div className="embed-editor_selector-suggest" ref={listRef} role="listbox" aria-label="Query suggestions">
+          {filtered.map((s, i) => (
+            <button
+              key={`${s.kind}:${s.query}`}
+              type="button"
+              role="option"
+              aria-selected={i === highlight}
+              className={`embed-editor_suggest-item ${i === highlight ? 'is-active' : ''}`}
+              onMouseDown={(event) => event.preventDefault()}
+              onMouseMove={() => setHighlight(i)}
+              onClick={() => submit(s.query)}
+            >
+              <span className="embed-editor_suggest-sel">{s.query}</span>
+              <span className="embed-editor_suggest-kind">{s.kind}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+// Inline form to add a custom query (@media/@container/@supports) to the current
+// selector, choosing whether it WRAPS the selector (a new at-rule block) or NESTS
+// inside the selector's existing rule (CSS nesting). Nesting needs a picked selector.
+// The controls sit ABOVE the input so the suggestion list (opened below it) can't
+// cover them; the input pre-fills `@` and offers project + common queries.
+function AddQueryForm({ canNest, suggestions, onAdd, onCancel }: {
+  canNest: boolean
+  suggestions: QuerySuggestion[]
+  onAdd: (query: string, mode: 'wrap' | 'nest') => void
+  onCancel: () => void
+}) {
+  const [draft, setDraft] = useState('@')
+  const [mode, setMode] = useState<'wrap' | 'nest'>('nest')
+  const submit = (text: string) => onAdd(text, canNest ? mode : 'wrap')
 
   return (
     <div className="embed-editor_add-query">
@@ -1551,42 +1777,55 @@ function AddQueryForm({ canNest, suggestions, onAdd, onCancel }: {
       {!canNest ? (
         <p className="embed-editor_add-query-note">Pick a selector to nest inside it.</p>
       ) : null}
-      <div className="embed-editor_add-query-field">
-        <input
-          ref={inputRef}
-          className="u-input embed-editor_add-query-input"
-          value={draft}
-          placeholder="@media (width < 50em)"
-          spellCheck={false}
-          role="combobox"
-          aria-expanded={showList}
-          aria-autocomplete="list"
-          onFocus={() => setOpen(true)}
-          onBlur={() => setOpen(false)}
-          onChange={(event) => { setDraft(event.target.value); setOpen(true); setHighlight(-1) }}
-          onKeyDown={onKeyDown}
-          aria-label="Query to add"
-        />
-        {showList ? (
-          <div className="embed-editor_selector-suggest" ref={listRef} role="listbox" aria-label="Query suggestions">
-            {filtered.map((s, i) => (
-              <button
-                key={`${s.kind}:${s.query}`}
-                type="button"
-                role="option"
-                aria-selected={i === highlight}
-                className={`embed-editor_suggest-item ${i === highlight ? 'is-active' : ''}`}
-                onMouseDown={(event) => event.preventDefault()}
-                onMouseMove={() => setHighlight(i)}
-                onClick={() => submit(s.query)}
-              >
-                <span className="embed-editor_suggest-sel">{s.query}</span>
-                <span className="embed-editor_suggest-kind">{s.kind}</span>
-              </button>
-            ))}
-          </div>
-        ) : null}
+      <QueryCombo
+        draft={draft}
+        setDraft={setDraft}
+        onSubmit={submit}
+        onCancel={onCancel}
+        suggestions={suggestions}
+        ariaLabel="Query to add"
+      />
+    </div>
+  )
+}
+
+// Rename a query wherever this stylesheet spells it. A breakpoint is one idea
+// written in several places — this component's four `@media (width >= 64rem)`
+// blocks are one breakpoint — so editing it here rewrites every one of them, and
+// the count says how many before you commit to it.
+function EditQueryForm({ query, uses, sourceLabel, suggestions, onRename, onCancel }: {
+  query: string
+  uses: number
+  sourceLabel: string
+  suggestions: QuerySuggestion[]
+  onRename: (from: string, to: string) => void
+  onCancel: () => void
+}) {
+  const [draft, setDraft] = useState(query)
+  const changed = draft.trim() !== '' && draft.trim() !== '@' && draft.trim() !== query
+  const submit = (text: string) => { const t = text.trim(); if (t && t !== '@' && t !== query) onRename(query, t) }
+
+  return (
+    <div className="embed-editor_add-query is-rename">
+      <div className="embed-editor_add-query-controls">
+        <span className="embed-editor_add-query-count" title={`${uses === 1 ? '1 block' : `${uses} blocks`} in ${sourceLabel}`}>
+          {uses === 1 ? '1 block' : `${uses} blocks`} in {sourceLabel}
+        </span>
+        <div className="embed-editor_add-query-actions">
+          <button type="button" className="u-button is-ghost is-small" onClick={onCancel}>Cancel</button>
+          <button type="button" className="u-button is-primary is-small" onClick={() => submit(draft)} disabled={!changed}>Rename</button>
+        </div>
       </div>
+      <QueryCombo
+        draft={draft}
+        setDraft={setDraft}
+        onSubmit={submit}
+        onCancel={onCancel}
+        suggestions={suggestions}
+        ariaLabel="Query"
+        initial={query}
+        selectOnFocus
+      />
     </div>
   )
 }
@@ -1595,6 +1834,7 @@ function StyleCard({
   snapshot,
   selectedNames,
   selectedSelector,
+  activePicked,
   onSelectNames,
   resolved,
   contexts,
@@ -1602,6 +1842,9 @@ function StyleCard({
   context,
   onContext,
   onAddQuery,
+  onRenameQuery,
+  queryUses,
+  sourceLabel,
   querySuggestions,
   selectors,
   suggestions,
@@ -1615,6 +1858,7 @@ function StyleCard({
   sourceNote,
   nativeStyleName,
   loading,
+  resolving,
   busy,
   pending,
   setProp,
@@ -1630,6 +1874,7 @@ function StyleCard({
   snapshot: ElementSnapshot | undefined
   selectedNames: string[]
   selectedSelector: string
+  activePicked: boolean
   onSelectNames: (names: string[]) => void
   resolved: ResolvedStyle
   contexts: StyleContext[]
@@ -1637,6 +1882,11 @@ function StyleCard({
   context: ContextKey
   onContext: (context: ContextKey) => void
   onAddQuery: (query: string, mode: 'wrap' | 'nest') => void
+  onRenameQuery: (from: string, to: string) => void
+  /** How many blocks in the source stylesheet each query is written in — the
+   *  queries it's possible to rename from here, and how much a rename touches. */
+  queryUses: Map<string, number>
+  sourceLabel: string
   querySuggestions: QuerySuggestion[]
   selectors: MatchedSelector[]
   suggestions: SelectorSuggestion[]
@@ -1651,6 +1901,9 @@ function StyleCard({
   nativeStyleName: string | null
   /** Still fetching embeds — show a spinner in place of the source picker. */
   loading: boolean
+  /** Still working out which selectors style this element — the well says so
+   *  rather than reading as "none". */
+  resolving: boolean
   busy: boolean
   pending: boolean
   setProp: (prop: string, value: string, important: boolean) => void
@@ -1666,6 +1919,8 @@ function StyleCard({
   const selectedRule = resolved.selectedRule
   // Whether the "Add query" form is open (below the context dropdown).
   const [addingQuery, setAddingQuery] = useState(false)
+  // The query being renamed, if any — same slot as the add form, one at a time.
+  const [editingQuery, setEditingQuery] = useState<string | null>(null)
   // The open provenance popover: which prop + the clicked label's rect (so the
   // popover anchors to the bottom of that label, not a fixed corner of the card).
   const [provenance, setProvenance] = useState<{ prop: string; rect: DOMRect } | null>(null)
@@ -1707,15 +1962,27 @@ function StyleCard({
             className="embed-editor_context-select"
             value={context}
             options={[
-              ...contexts.map((ctx) => ({
-                value: ctx.key,
-                label: ctx.label,
-                icon: breakpointIcon(ctx.breakpoint),
-                marked: contextInfos.find((info) => info.key === ctx.key)?.hasStyles ?? false,
-              })),
+              ...contexts.map((ctx) => {
+                // Editable when this stylesheet is where the query is written. A
+                // row can be here for a query held in some other file (or for a
+                // native breakpoint, which is no at-rule at all) — nothing to
+                // rename there, so no pencil. A nested chain's own query is its
+                // last link; the ones before it are rows of their own.
+                const query = (ctx.embedAtContext || '').split(' › ').pop() || ''
+                const uses = queryUses.get(queryKey(query)) ?? 0
+                return {
+                  value: ctx.key,
+                  label: ctx.label,
+                  icon: breakpointIcon(ctx.breakpoint),
+                  marked: contextInfos.find((info) => info.key === ctx.key)?.hasStyles ?? false,
+                  action: uses > 0
+                    ? { icon: <PencilIcon />, label: `Edit ${query}`, onSelect: () => { setAddingQuery(false); setEditingQuery(query) } }
+                    : undefined,
+                }
+              }),
               { value: ADD_QUERY, label: 'Add query', icon: <PlusIcon /> },
             ]}
-            onChange={(next) => { if (next === ADD_QUERY) setAddingQuery(true); else onContext(next) }}
+            onChange={(next) => { if (next === ADD_QUERY) { setEditingQuery(null); setAddingQuery(true) } else onContext(next) }}
             ariaLabel="Style context"
           />
         ) : null}
@@ -1726,6 +1993,16 @@ function StyleCard({
           suggestions={querySuggestions}
           onCancel={() => setAddingQuery(false)}
           onAdd={(query, mode) => { setAddingQuery(false); onAddQuery(query, mode) }}
+        />
+      ) : null}
+      {editingQuery ? (
+        <EditQueryForm
+          query={editingQuery}
+          uses={queryUses.get(queryKey(editingQuery)) ?? 0}
+          sourceLabel={sourceLabel}
+          suggestions={querySuggestions}
+          onCancel={() => setEditingQuery(null)}
+          onRename={(from, to) => { setEditingQuery(null); onRenameQuery(from, to) }}
         />
       ) : null}
       <div className="embed-editor_selector">
@@ -1748,7 +2025,9 @@ function StyleCard({
         selectors={selectors}
         suggestions={suggestions}
         activeSelector={activeSelector}
+        activePicked={activePicked}
         busy={busy}
+        loading={resolving}
         onSelect={onSelectActive}
         onDeselect={onDeselect}
         onAdd={onAddSelector}
@@ -1821,6 +2100,13 @@ function StyleCard({
               key={group.def.id}
               label={group.def.label}
               defaultOpen={group.def.id !== 'flex-child'}
+              // A dot whenever anything in the section reaches the element, and
+              // blue once the picked selector is one of the things setting it —
+              // `source === 'selected'` is the same test every property label in
+              // here makes.
+              mark={group.props.some((prop) => read(prop)?.source === 'selected')
+                ? 'own'
+                : (group.props.length ? 'other' : null)}
               headerAction={group.def.id === 'spacing'
                 ? <SpacingCenterButton read={read} busy={busy} setProp={setProp} clearProp={clearProp} />
                 : undefined}
@@ -1956,10 +2242,21 @@ type Content = {
 
 // Re-read every embed no more than this often when just switching selection.
 const BG_REFRESH_THROTTLE_MS = 4000
+
+/** Which stylesheets the host is offering, as a comparable string. */
+function sheetSignature(): string {
+  const host = getHost()
+  return [...host.files, ...host.astroFiles].map((f) => f.path).join('|')
+}
 // How often to poll the Designer for out-of-app edits (classes / attributes /
 // native styles). The API has no change events, so we re-read on this cadence and
 // apply only when a signature actually differs.
 const DESIGNER_SYNC_INTERVAL_MS = 1500
+
+/** The selectors currently in play, as one comparable string: what the canvas was
+ *  last asked about. Values aren't in it — changing one doesn't change which rules
+ *  target the element, so it doesn't warrant asking again. */
+const selectorKeyOf = (rules: ParsedRule[]): string => rules.map((r) => r.selectorText).join('\n')
 
 // A fingerprint of the selected element's identity (tag + id + classes + attrs) —
 // changes when a class or data attribute is added/removed in the Designer.
@@ -1996,8 +2293,9 @@ function chainPrefixDepth(classes: string[], classList: string[]): number {
 
 // The chip display order: tag → base class (`.test`) → its pseudos (`.test:hover`,
 // `.test:is(:hover,:focus)`) → the applied combo chain (`.test.is-2` → `.test.is-2.ready`
-// + pseudos) → standalone/global classes (`.is-2`) → data attributes → complex/nested
-// selectors (`body > .test`). Returns a comparable [category, depth, pseudo] tuple.
+// + pseudos) → the element's remaining classes IN THE ORDER THEY'RE APPLIED →
+// data attributes → complex/nested selectors (`body > .test`). Returns a
+// comparable [category, depth, pseudo] tuple.
 function selectorOrder(text: string, classList: string[]): [number, number, number] {
   const canon = canonicalCompound(text)
   const classes = canon.tokens.filter((t) => t.startsWith('class:')).map((t) => t.slice('class:'.length))
@@ -2008,7 +2306,17 @@ function selectorOrder(text: string, classList: string[]): [number, number, numb
   if (classes.length) {
     const depth = chainPrefixDepth(classes, classList)
     if (depth > 0) return [1, depth, pseudo] // element's own chain: base(1) → combos
-    return [2, 0, pseudo] // standalone / global class
+    // Not a prefix chain of the applied classes. These all used to tie at 0 and
+    // fall through to specificity, then alphabetical — so the chips came out in
+    // an order the element knows nothing about. Rank them by where the class
+    // actually sits in `class="…"` instead. A combo sorts by its last applied
+    // class; a class that isn't on the element at all goes after them.
+    let applied = -1
+    for (const cls of classes) {
+      const at = classList.indexOf(cls)
+      if (at > applied) applied = at
+    }
+    return [2, applied === -1 ? classList.length : applied, pseudo]
   }
   if (hasAttr) return [3, 0, pseudo] // data attributes
   if (hasTag) return [0, 0, 0] // a tag that has styles — first
@@ -2055,6 +2363,91 @@ let persistedScan: {
   scanAt: number
 } | null = null
 
+// The last RESOLVED view — the matched model and the element snapshot the selector
+// chips are drawn from. persistedScan above keeps the parsed stylesheets; this keeps
+// what they resolved to for the selected element. The panel is unmounted whenever the
+// right tab isn't Style — and removing a class happens in Settings, which is exactly
+// that — so without this, coming back blanks the selector well until a full re-resolve
+// (a canvas round trip plus a re-match of every rule) lands. Restored only while the
+// same element is still selected; a background refresh reconciles it either way.
+let persistedView: {
+  /** Node id + the file it belongs to: ids are per-page, so the file has to match too. */
+  hostId: string
+  filePath: string | null
+  elementKey: string
+  scan: ScanState
+  quick: ElementSnapshot | null
+} | null = null
+
+const viewKeyMatches = (view: typeof persistedView) => {
+  const host = getHost()
+  return !!view && !!host.selectedId && view.hostId === host.selectedId && view.filePath === host.openFilePath
+}
+
+// The selected node's authored classes, straight from the page model. A `class` set by
+// an expression has no literal text to read, and reports none.
+function authoredClasses(): string[] {
+  const host = getHost()
+  const node = host.selectedId ? findNode(host.nodes, host.selectedId) : null
+  return propText(node, 'class').trim().split(/\s+/).filter(Boolean)
+}
+
+/**
+ * Classes the page model has just lost.
+ *
+ * The panel's snapshot unions the authored classes with the ones the PREVIEW last
+ * reported (so classes added at runtime still show), and the preview goes on
+ * reporting a removed class until the dev server re-renders the page. Left alone, a
+ * class you just deleted sits in the selector well for that whole round trip — and
+ * a re-scan in between puts it back. Anything that drops out of the authored list is
+ * hidden from that moment; it returns if the class does, and is forgotten once the
+ * preview stops reporting it too.
+ */
+export function useRemovedClasses(): ReadonlySet<string> {
+  const [removed, setRemoved] = useState<ReadonlySet<string>>(EMPTY_CLASSES)
+  const prevRef = useRef<string[]>(authoredClasses())
+  const nodeRef = useRef<string | null>(getHost().selectedId)
+  useEffect(() => {
+    const sync = () => {
+      const host = getHost()
+      const now = authoredClasses()
+      const prev = prevRef.current
+      prevRef.current = now
+      // A different element: nothing carries over.
+      if (host.selectedId !== nodeRef.current) {
+        nodeRef.current = host.selectedId
+        setRemoved((old) => (old.size ? EMPTY_CLASSES : old))
+        return
+      }
+      setRemoved((old) => {
+        const next = new Set(old)
+        for (const cls of prev) if (!now.includes(cls)) next.add(cls)
+        for (const cls of now) next.delete(cls)
+        // Once the preview has caught up there is nothing left to hide.
+        const rendered = host.renderedClasses || []
+        for (const cls of [...next]) if (!rendered.includes(cls)) next.delete(cls)
+        if (next.size === old.size && [...next].every((c) => old.has(c))) return old
+        return next
+      })
+    }
+    sync()
+    return onHostChange(sync)
+  }, [])
+  return removed
+}
+
+const EMPTY_CLASSES: ReadonlySet<string> = new Set()
+
+// The same snapshot without the classes that have just been removed — what the
+// element is now, rather than what the preview last saw.
+export function withoutClasses(snapshot: ElementSnapshot | undefined, hidden: ReadonlySet<string>): ElementSnapshot | undefined {
+  if (!snapshot || !hidden.size) return snapshot
+  const classes = snapshot.classes.filter((c) => !hidden.has(c))
+  const classList = snapshot.classList.filter((c) => !hidden.has(c))
+  if (classes.length === snapshot.classes.length && classList.length === snapshot.classList.length) return snapshot
+  return { ...snapshot, classes, classList, attributes: { ...snapshot.attributes, class: classList.join(' ') } }
+}
+
 // Cache the component embed SOURCES (the expensive part: the per-component tree
 // DFS to find embeds) at module scope, reused across page switches and reopens.
 // The CODE is re-read on every build, so external edits to a component embed are
@@ -2070,10 +2463,15 @@ const nativeModelCache = new Map<string, NativeModel>()
 
 export default function EmbedEditor() {
   const selectedRef = useRef<unknown>(null)
+  // The view this panel had when it was last unmounted, if the same element is still
+  // selected — the chips render from it on the first paint instead of an empty well.
+  const restoredRef = useRef(viewKeyMatches(persistedView) ? persistedView : null)
   // Identity of the last element we reset the selection for — so a NEW element clears
   // the previous one's picked selector (the token signature isn't reliable: distinct
   // elements can share it, especially when classes aren't readable in a component).
-  const selectedElementKeyRef = useRef('')
+  // Seeded from the restored view, so returning to the SAME element doesn't read as a
+  // change and blank everything.
+  const selectedElementKeyRef = useRef(restoredRef.current?.elementKey ?? '')
   // The panel root — used to focus a specific property's field by [data-prop].
   const rootRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<Content | null>(persistedScan?.content ?? null)
@@ -2119,11 +2517,13 @@ export default function EmbedEditor() {
   useEffect(() => () => { if (busyTimerRef.current != null) window.clearTimeout(busyTimerRef.current) }, [])
 
   const [phase, setPhase] = useState<Phase>('idle')
-  const [scan, setScan] = useState<ScanState | null>(null)
+  const [scan, setScan] = useState<ScanState | null>(restoredRef.current?.scan ?? null)
   // A fast, scan-independent snapshot (tag + classes) read straight off the
   // selected element so the chips appear immediately, before the embed scan's
   // fuller rootSnapshot arrives.
-  const [quickSnapshot, setQuickSnapshot] = useState<ElementSnapshot | null>(null)
+  const [quickSnapshot, setQuickSnapshot] = useState<ElementSnapshot | null>(restoredRef.current?.quick ?? null)
+  // Classes removed since the panel last resolved — hidden from the chips at once.
+  const removedClasses = useRemovedClasses()
   const [status, setStatus] = useState('Select an element to inspect its embed styles.')
   const [busy, setBusy] = useState(false)
   // Last save failure (surfaced by the header save indicator, not as body text).
@@ -2388,9 +2788,16 @@ export default function EmbedEditor() {
 
   // The cheap part — resolve the selected element against cached content.
   const applyResolve = useCallback(async (element: unknown, content: Content, seq: number, silent = false) => {
-    const { target, rootSnapshot } = await resolveTarget(element as never, content.scan)
+    // Ask the rendered page first — it knows what components render and what
+    // classes ran at runtime; the source tree can't see either. One question
+    // covers both halves (identity + which selectors match), so the chips wait
+    // out a single round trip rather than two back to back.
+    const asked = await askCanvasAbout(serializeElementId(element as never), content.rules)
+    const { target, rootSnapshot } = await resolveTarget(element as never, content.scan, asked)
     if (seq !== seqRef.current) return
     targetRef.current = target
+    await primeDomMatches(target, content.rules, asked)
+    primedRef.current = { target, key: selectorKeyOf(content.rules) }
     const model = await computeRuleModel(content.rules, target)
     if (seq !== seqRef.current) return
     // Don't let a lagging partial clobber the final (partials share seq*2+0, the
@@ -2437,9 +2844,12 @@ export default function EmbedEditor() {
 
   // Rebuild content in the background (coalesced + throttled) to pick up embed
   // edits, then re-resolve the current selection — without blocking the UI.
-  const backgroundRefresh = useCallback(async () => {
+  const backgroundRefresh = useCallback(async ({ now = false }: { now?: boolean } = {}) => {
     if (refreshingRef.current || busyRef.current) return
-    if (Date.now() - lastScanAtRef.current < BG_REFRESH_THROTTLE_MS) return
+    // `now` skips the throttle: something rewrote the files or the model out
+    // from under the panel (an undo), and waiting out a polling interval to
+    // notice is what made the panel trail the canvas.
+    if (!now && Date.now() - lastScanAtRef.current < BG_REFRESH_THROTTLE_MS) return
     refreshingRef.current = true
     setRefreshing(true)
     try {
@@ -2461,6 +2871,9 @@ export default function EmbedEditor() {
   // (the API has no change events). Cheap in steady state: it reads + compares
   // signatures and only touches state when something actually differs. Embed-code
   // edits are picked up separately by the (throttled) backgroundRefresh.
+  // What the canvas was last asked about, and for which element — see
+  // refreshDerived.
+  const primedRef = useRef<{ target: MatchTarget; key: string } | null>(null)
   const lastSnapSigRef = useRef('')
   const syncFromDesigner = useCallback(async () => {
     if (busyRef.current || refreshingRef.current) return
@@ -2471,8 +2884,10 @@ export default function EmbedEditor() {
     let target: MatchTarget
     let snap: ElementSnapshot
     let native: NativeModel
+    let asked: Awaited<ReturnType<typeof askCanvasAbout>>
     try {
-      const resolved = await resolveTarget(element as never, content.scan)
+      asked = await askCanvasAbout(serializeElementId(element as never), content.rules)
+      const resolved = await resolveTarget(element as never, content.scan, asked)
       target = resolved.target
       snap = resolved.rootSnapshot
       // Read from the RESOLVED identity element (as refreshNative and the load effect
@@ -2502,6 +2917,9 @@ export default function EmbedEditor() {
     if (snapChanged) {
       // Classes / attributes changed → selectors re-match; re-resolve against the
       // cached embeds and refresh the header identity.
+      // Reuses the answer the identity read above already got back.
+      await primeDomMatches(target, content.rules, asked)
+      primedRef.current = { target, key: selectorKeyOf(content.rules) }
       const model = await computeRuleModel(content.rules, target)
       if (busyRef.current || element !== selectedRef.current) return
       targetRef.current = target
@@ -2515,7 +2933,7 @@ export default function EmbedEditor() {
     }
   }, [])
 
-  const refresh = useCallback(async (element: unknown | null, opts: { force?: boolean } = {}) => {
+  const resolveSelection = useCallback(async (element: unknown | null, opts: { force?: boolean } = {}) => {
     const seq = ++seqRef.current
     selectedRef.current = element
 
@@ -2529,6 +2947,16 @@ export default function EmbedEditor() {
       setSelectedTokens([])
       setStateKey('')
       setQuickSnapshot(null) // drop the previous element's chips
+      // The chips are derived from these two models, and both are refilled by
+      // async reads. Left alone they keep listing the PREVIOUS element's
+      // selectors until those land — the list looks stale for as long as the
+      // scan takes. Blank them now: an empty well for a moment is honest,
+      // another element's selectors are not. A cached native model comes
+      // straight back in the identity effect, so that case barely blinks.
+      setScan((prev) => (prev ? { ...prev, model: EMPTY_RULE_MODEL } : prev))
+      setNativeModel(null)
+      nativeModelRef.current = null
+      nativeIdentityRef.current = ''
       // Force the tokens effect to re-default even if the new element shares the old
       // one's token signature (both classless divs, unreadable classes, …).
       tokenIdentityRef.current = ''
@@ -2605,6 +3033,47 @@ export default function EmbedEditor() {
     }
   }, [applyResolve, backgroundRefresh, rebuildAndStore])
 
+  // Whether the panel is still working out what styles the selected element.
+  //
+  // The chips are blanked the moment the selection changes (another element's
+  // selectors are worse than none) and refilled from canvas round trips, so in
+  // between, the selector well is empty — and an empty well otherwise says "nothing
+  // styles this". The wait needs to be able to say it is a wait. Counted rather than
+  // flagged: reselecting starts a second pass before the first has unwound, and the
+  // first one finishing does not mean the panel is settled.
+  const [resolving, setResolving] = useState(false)
+  const resolvingRef = useRef(0)
+
+  const refresh = useCallback(async (element: unknown | null, opts: { force?: boolean } = {}) => {
+    resolvingRef.current += 1
+    setResolving(true)
+    try {
+      await resolveSelection(element, opts)
+    } finally {
+      resolvingRef.current -= 1
+      if (resolvingRef.current === 0) setResolving(false)
+    }
+  }, [resolveSelection])
+
+  // The project's stylesheets are listed asynchronously (style:listFiles and the
+  // Astro global-block scan), and the panel is usually mounted and finished
+  // scanning before that list lands: it reads no files, matches nothing, and
+  // calls itself ready with an empty well. It used to stay that way until the
+  // next background refresh came round — throttled to 4s, which is exactly how
+  // long the well sat empty on a layout. Rescan as soon as the list changes
+  // instead.
+  const sheetSigRef = useRef(sheetSignature())
+  useEffect(
+    () =>
+      onHostChange(() => {
+        const sig = sheetSignature()
+        if (sig === sheetSigRef.current) return
+        sheetSigRef.current = sig
+        void refresh(selectedRef.current, { force: true })
+      }),
+    [refresh]
+  )
+
   useEffect(() => {
     const api = webflowApi()
     if (!api?.getSelectedElement) {
@@ -2625,6 +3094,41 @@ export default function EmbedEditor() {
     }
   }, [refresh])
 
+  // Undo and redo rewrite the stylesheets and the page model directly, so the
+  // panel's cached docs are stale the moment they run. The app bumps a counter;
+  // re-read as soon as it moves rather than on the next poll.
+  const historyRef = useRef(getHost().historyTick)
+  useEffect(
+    () =>
+      onHostChange(() => {
+        const tick = getHost().historyTick
+        if (tick === historyRef.current) return
+        historyRef.current = tick
+        void backgroundRefresh({ now: true })
+      }),
+    [backgroundRefresh]
+  )
+
+  // A class added to (or taken off) the selected element changes which selectors
+  // target it — and nothing tells the panel. It used to find out on its next poll,
+  // up to 1.5s later, which is the whole of that wait: the stylesheets are already
+  // parsed in memory, so re-resolving is one canvas round trip and a re-match, no
+  // disk. Nudge it the moment the model changes. The background rebuild that re-reads
+  // the files still runs on its own throttle, for edits made outside the app.
+  const classSigRef = useRef('')
+  useEffect(() => {
+    const onClasses = () => {
+      const host = getHost()
+      const sig = `${authoredClasses().join(' ')}|${(host.renderedClasses || []).join(' ')}`
+      if (sig === classSigRef.current) return
+      const first = classSigRef.current === ''
+      classSigRef.current = sig
+      if (!first) void syncFromDesigner()
+    }
+    onClasses()
+    return onHostChange(onClasses)
+  }, [syncFromDesigner])
+
   // While an element is shown, poll for out-of-app edits and keep the panel in sync.
   useEffect(() => {
     if (phase !== 'ready') return
@@ -2636,16 +3140,41 @@ export default function EmbedEditor() {
   }, [phase, syncFromDesigner, backgroundRefresh])
 
   const refreshDerived = useCallback(async () => {
+    // The page's computed values were measured against the CSS as it was a
+    // moment ago, and an edit is exactly what changes them. They used to be
+    // forgotten only when the canvas re-walked its markers — which a CSS-only
+    // edit never makes it do, because the dev server delivers CSS by swapping a
+    // <style> in <head> rather than re-rendering the page.
+    //
+    // A control that shows a COMPUTED value while nothing declares its property
+    // therefore went on showing the value from before the edit: clear
+    // `text-align` and the segment for the old alignment stayed lit, while the
+    // canvas behind it had already gone back to the inherited one.
+    forgetComputedStyles()
     const rules = rebuildRules(docsRef.current)
     if (contentRef.current) contentRef.current.rules = rules
     const target = targetRef.current
     if (!target) return
+    // Only re-ask the page when the question changed. domMatched is keyed by
+    // selector text, so as long as the same element is selected and the same
+    // selectors exist, the answers it holds are still the answers — and an
+    // edit that only changed a VALUE (most of them) changes neither. Asking
+    // anyway put a round trip, and its 1.5s ceiling, after every click.
+    const key = selectorKeyOf(rules)
+    if (!(primedRef.current?.target === target && primedRef.current.key === key)) {
+      await primeDomMatches(target, rules)
+      primedRef.current = { target, key }
+    }
     const model = await computeRuleModel(rules, target)
     const placeholders = contentRef.current?.scan.inComponentContext
       ? computePlaceholders(contentRef.current.docs, classListRef.current)
       : []
     setScan((prev) => (prev ? { ...prev, model, placeholders } : prev))
   }, [])
+
+  // An undo/redo rewrote a stylesheet and re-parsed its doc in place — re-resolve
+  // so the fields show what the file now says.
+  useEffect(() => onDocsReloaded(() => { void refreshDerived() }), [refreshDerived])
 
   // True when the active selector is ONE splittable member of a grouped rule
   // (`.a::before, .b::after { … }`) — i.e. an edit should be scoped to just that
@@ -2715,7 +3244,7 @@ export default function EmbedEditor() {
         // in-memory edit and remember it — it flushes automatically on exit.
         if (inComponentRef.current && !doc.source.fromComponent) {
           markPending(doc.source.key)
-          setStatus('Kept as unsaved — page embeds save when you exit the component.')
+          setStatus('Held — this rule lives in the page, so the canvas shows it once you leave the component.')
           return
         }
         setSaveError(res.error)
@@ -2869,7 +3398,7 @@ export default function EmbedEditor() {
         if (!res.ok) {
           if (inComponentRef.current && !doc.source.fromComponent) {
             markPending(doc.source.key)
-            setStatus('Kept as unsaved — page embeds save when you exit the component.')
+            setStatus('Held — this rule lives in the page, so the canvas shows it once you leave the component.')
             return
           }
           setSaveError(res.error)
@@ -2898,9 +3427,29 @@ export default function EmbedEditor() {
     setRawRuleId((cur) => (cur === ruleId ? null : ruleId))
   }, [])
 
+  // Keep the resolved view at module scope so the next mount starts from it (see
+  // persistedView). Written as it changes rather than on unmount, which React skips
+  // when the whole tree goes.
+  useEffect(() => {
+    const host = getHost()
+    if (!host.selectedId || !scan) return
+    persistedView = {
+      hostId: host.selectedId,
+      filePath: host.openFilePath,
+      elementKey: selectedElementKeyRef.current,
+      scan,
+      quick: quickSnapshot,
+    }
+  }, [scan, quickSnapshot])
+
   // Prefer the scan's full rootSnapshot; fall back to the fast quick snapshot so
-  // the chips show while the scan is still running.
-  const snapshot = scan?.rootSnapshot ?? quickSnapshot ?? undefined
+  // the chips show while the scan is still running. Either can still carry a class
+  // the element has just lost (both union in what the preview last reported), so
+  // those are taken out here rather than waited out.
+  const snapshot = useMemo(
+    () => withoutClasses(scan?.rootSnapshot ?? quickSnapshot ?? undefined, removedClasses),
+    [scan, quickSnapshot, removedClasses],
+  )
 
   const model = scan?.model
   const tokens = useMemo(() => snapshotTokens(snapshot), [snapshot])
@@ -2930,22 +3479,23 @@ export default function EmbedEditor() {
     return out
   }, [tokens, snapshot])
 
-  // Re-default the picked selector when the element changes: all classes (the full
-  // combo chain, like Webflow's default) → else last data attribute → else the tag.
-  // Also reset context/state.
+  // Re-default the picked selector when the element changes: the element's FIRST
+  // class → else last data attribute → else the tag. Also reset context/state.
+  //
+  // It used to be every class the element has, joined — Webflow's model, where
+  // a combo IS the thing being styled. Here it meant the first property written
+  // created `.layout.card.theme-dark.flex-grow.theme-brand { … }`, and because
+  // the combo then counted as "already styled", the upgrade below kept it and
+  // every property after it landed there too. A five-class rule nothing else can
+  // reuse, built one property at a time, from a default nobody chose.
+  //
+  // The primary class is what a class system is authored against; a combo is a
+  // deliberate act, so it takes picking that chip.
   useEffect(() => {
     const identity = tokens.map((token) => token.name).join('|')
     if (identity === tokenIdentityRef.current) return
     tokenIdentityRef.current = identity
-    const classes = tokens.filter((token) => token.kind === 'class')
-    const attrs = tokens.filter((token) => token.kind === 'attribute')
-    const next = classes.length
-      ? classes.map((token) => token.name)
-      : attrs.length
-        ? [attrs[attrs.length - 1].name]
-        : tokens.length
-          ? [tokens[0].name]
-          : []
+    const next = defaultSelectorTokens(tokens)
     setSelectedTokens(next)
     setSelectedSelectorText(null)
     defaultTokensRef.current = next
@@ -2975,6 +3525,13 @@ export default function EmbedEditor() {
     // Instant: serve the cached model for this class-signature while re-reading in
     // the background, so re-selecting an element doesn't re-lag its native chips.
     const cached = nativeModelCache.get(elementIdentity)
+    if (!cached && nativeModelRef.current) {
+      // A class change on the same element: the model in hand describes the old
+      // class list, so it can't stand in while the new one loads.
+      nativeModelRef.current = null
+      nativeIdentityRef.current = ''
+      setNativeModel(null)
+    }
     if (cached) {
       // Show the cached chips immediately, but do NOT advance nativeIdentityRef here:
       // setNativeModel is async, so the ref would outrun the model the smart-default
@@ -3091,6 +3648,24 @@ export default function EmbedEditor() {
         return
       }
     }
+    // A lone class typed here should also land on the element, the way a
+    // class field would. Anything more — a combinator, :is(), a state, a
+    // second token — is a selector being authored deliberately, so the
+    // element is left alone. canonicalCompound already draws that line.
+    const canon = canonicalCompound(trimmed)
+    if (
+      canon.simple &&
+      canon.oneCompound &&
+      !canon.pseudoElement &&
+      canon.pseudoClasses.length === 0 &&
+      canon.tokens.length === 1 &&
+      canon.tokens[0].startsWith('class:')
+    ) {
+      getHost().addClass?.(canon.tokens[0].slice('class:'.length))
+      // The element itself changed, so the matches the canvas gave us for these
+      // same selectors no longer hold — ask again on the next refresh.
+      primedRef.current = null
+    }
     selectActiveSelector(trimmed)
   }, [selectActiveSelector])
   // Add a custom query (@media/@container/@supports) to the current selector from the
@@ -3101,9 +3676,7 @@ export default function EmbedEditor() {
   const onAddQuery = (raw: string, mode: 'wrap' | 'nest') => {
     const trimmed = raw.trim()
     if (!trimmed) return
-    const query = trimmed.startsWith('@')
-      ? trimmed
-      : trimmed.startsWith('(') ? `@media ${trimmed}` : `@media (${trimmed})`
+    const query = asQuery(trimmed)
     if (mode === 'nest' && activeSelector) {
       const nestedInput = `${activeSelector} { ${query} }`
       addTypedSelector(nestedInput)
@@ -3151,27 +3724,102 @@ export default function EmbedEditor() {
     })
     return () => cancelAnimationFrame(raf)
   }, [focusProp])
+  // The stylesheet a new rule would land in: the user's pick, or the first embed
+  // in page order — the same default `effectiveSourceSel` settles on below, worked
+  // out here because the queries dropdown needs it before that line runs.
+  const sourceDoc = useMemo<EmbedDoc | null>(() => {
+    if (sourceSel && docByKey.has(sourceSel)) return docByKey.get(sourceSel) ?? null
+    return [...docByKey.values()].sort((a, b) => a.source.order - b.source.order)[0] ?? null
+  }, [sourceSel, docByKey])
+  // How many blocks in that stylesheet each query is written in. Drives the edit
+  // pencil in the query dropdown (a query this file doesn't hold can't be renamed
+  // from here) and the "3 blocks in ContentWrapper" count on the rename form.
+  const queryUses = useMemo(() => {
+    const uses = new Map<string, number>()
+    if (!sourceDoc) return uses
+    for (const region of sourceDoc.regions) {
+      region.root?.walkAtRules((at) => {
+        const name = at.name.toLowerCase()
+        if (name !== 'media' && name !== 'supports' && name !== 'container') return
+        // Keyed so two spellings of one query count as one — the pencil on
+        // either row then reports, and renames, both.
+        const text = queryKey(atRuleQueryText(at))
+        uses.set(text, (uses.get(text) ?? 0) + 1)
+      })
+    }
+    return uses
+  }, [sourceDoc])
+  // Rename a query everywhere the source stylesheet spells it. A breakpoint lives
+  // in a file as several identical `@media` lines — changing one of them by hand
+  // splits the breakpoint in two — so this rewrites all of them in one write, and
+  // the panel follows the query it was showing to its new name.
+  const onRenameQuery = (from: string, to: string) => {
+    const doc = sourceDoc
+    if (!doc) return
+    const next = asQuery(to)
+    if (!splitQuery(next)) { setStatus('A query starts with @ — @media, @container or @supports.'); return }
+    if (next === from) return
+    void (async () => {
+      setBusyBoth(true)
+      setStatus('Renaming query…')
+      // try/finally so a throw mid-rename can't leave every button disabled.
+      try {
+        let n = 0
+        for (const region of doc.regions) n += renameAtRuleQuery(region, from, next)
+        if (!n) { setStatus('That query isn’t in this file any more.'); return }
+        await refreshDerived()
+        const res = await writeEmbedDoc(doc)
+        if (!res.ok) {
+          if (inComponentRef.current && !doc.source.fromComponent) {
+            markPending(doc.source.key)
+            setStatus('Held — this query lives in the page, so the canvas shows it once you leave the component.')
+            return
+          }
+          setSaveError(res.error)
+          return
+        }
+        clearPending(doc.source.key)
+        // The context key is the at-rule chain; only the renamed link changes, so
+        // a nested context stays selected too.
+        const swap = (key: ContextKey) => key.split(' › ').map((part) => (part === from ? next : part)).join(' › ')
+        setTypedContexts((prev) => prev.map(swap))
+        setContext((prev) => swap(prev))
+        setStatus(n === 1 ? `Renamed to ${next}.` : `Renamed ${n} blocks to ${next}.`)
+      } finally {
+        setBusyBoth(false)
+      }
+    })()
+  }
   // Every embed query the picked element could switch to: Base + each
   // @media/@container block in the embeds whose rules match this element.
   const allContextKeys = useMemo<ContextKey[]>(() => {
     const keys: ContextKey[] = ['']
     const seen = new Set<ContextKey>([''])
+    const take = (doc: EmbedDoc) => {
+      for (const region of doc.regions) {
+        for (const block of listAtRuleBlocks(region)) {
+          const ctx = block.atContext.join(' › ')
+          if (!seen.has(ctx)) { seen.add(ctx); keys.push(ctx) }
+        }
+      }
+    }
     if (model) {
       const matchedDocKeys = new Set([...model.base, ...model.conditional].map((m) => m.rule.embedKey))
       for (const [key, doc] of docByKey) {
         if (!matchedDocKeys.has(key)) continue
-        for (const region of doc.regions) {
-          for (const block of listAtRuleBlocks(region)) {
-            const ctx = block.atContext.join(' › ')
-            if (!seen.has(ctx)) { seen.add(ctx); keys.push(ctx) }
-          }
-        }
+        take(doc)
       }
     }
+    // Every query the file being written into already uses, whether or not this
+    // element has a rule in one. That dropdown is where a query is chosen to
+    // write into, and a stylesheet's own queries are the ones worth offering: a
+    // component with a `prefers-reduced-motion` block should offer it on every
+    // element in that component, not only on the ones already inside it.
+    if (sourceDoc) take(sourceDoc)
     // Queries typed into the add-selector field (may not exist in any embed yet).
     for (const ctx of typedContexts) { if (!seen.has(ctx)) { seen.add(ctx); keys.push(ctx) } }
     return keys
-  }, [model, docByKey, typedContexts])
+  }, [model, docByKey, typedContexts, sourceDoc])
 
   // Suggestions for the "Add query" form: every @media/@container/@supports already
   // used ANYWHERE in the project's embeds (labeled "used"), then a curated set of
@@ -3188,35 +3836,60 @@ export default function EmbedEditor() {
     }
     for (const doc of docByKey.values()) {
       for (const region of doc.regions) {
-        for (const block of listAtRuleBlocks(region)) add(block.atContext.join(' › '), 'used')
+        // Each LINK of a nesting chain, not the chain — `@media A › @supports B`
+        // is how the panel names a context, but only `@media A` and `@supports B`
+        // are queries somebody can write into a file.
+        for (const block of listAtRuleBlocks(region)) for (const part of block.atContext) add(part, 'used')
       }
     }
     for (const c of COMMON_QUERIES) add(c.query, c.kind)
-    return out
+    // Size first. Breakpoints are what this list is reached for nearly every time
+    // — a layout has several and they get edited together — while hover, pointer
+    // and the prefers-* queries are set once and left. Sorting is stable, so
+    // within each group the file's own queries still come before the suggested
+    // ones, in the order the file has them.
+    const bySize = (query: string) => (/@container\b/.test(query) || /\b(width|height)\b/.test(query) ? 0 : 1)
+    return out.sort((a, b) => bySize(a.query) - bySize(b.query))
   }, [docByKey])
 
   // Embed queries where THIS element actually has styles — so custom @media /
   // @container (and up-breakpoints) only appear in the dropdown when used. The
   // current context is kept so viewing an empty query doesn't hide itself.
+  // The at-contexts the file being written into holds — the component's own
+  // queries, as opposed to ones reaching this element from a page stylesheet.
+  const sourceContexts = useMemo(() => {
+    const set = new Set<string>()
+    if (sourceDoc) {
+      for (const region of sourceDoc.regions) {
+        for (const block of listAtRuleBlocks(region)) set.add(block.atContext.join(' › '))
+      }
+    }
+    return set
+  }, [sourceDoc])
   const styledEmbedContexts = useMemo(() => {
     const set = new Set<string>()
     if (model) for (const info of indexContexts(model, allContextKeys)) if (info.hasStyles) set.add(info.key)
     if (context) set.add(context)
+    // …plus the queries the file being written into already uses. Those are
+    // offered for any element in it: the dropdown is how you get INTO a query
+    // to write the first rule there, so hiding a query until something is
+    // already in it is a door that only opens from the far side.
+    for (const key of sourceContexts) set.add(key)
     return set
-  }, [model, allContextKeys, context])
+  }, [model, allContextKeys, context, sourceContexts])
 
   // The unified context list: Base + the default Webflow breakpoints (always) +
   // breakpoints/queries the element uses. Drives the dropdown and which breakpoint
   // native reads/writes target.
   const styleContexts = useMemo<StyleContext[]>(() => {
-    const list = buildStyleContexts(allContextKeys, nativeModel, currentBreakpoint, styledEmbedContexts)
+    const list = buildStyleContexts(allContextKeys, nativeModel, currentBreakpoint, styledEmbedContexts, sourceContexts)
     // Keep the manually-selected query available on any element — even one with no
     // styles there yet — so switching elements stays on it and you can add a style.
     // Only needed for custom @media/@container (breakpoints are always built).
     const sticky = stickyContextRef.current
     if (context && sticky && sticky.key === context && !list.some((c) => c.key === context)) list.push(sticky)
     return list
-  }, [allContextKeys, nativeModel, currentBreakpoint, styledEmbedContexts, context])
+  }, [allContextKeys, nativeModel, currentBreakpoint, styledEmbedContexts, sourceContexts, context])
   const currentContext = useMemo<StyleContext>(
     () => styleContexts.find((entry) => entry.key === context)
       ?? styleContexts[0]
@@ -3323,6 +3996,22 @@ export default function EmbedEditor() {
     [model, currentContext, activeSelector, effectiveSource, nativeContribs, selectedNativeIndex, selectedEmbedKey],
   )
 
+  // The stylesheet the active selector's rule already lives in. resolveStyle
+  // picks selectedRule by selector identity and explicitly does NOT scope it to
+  // the source dropdown, so reading it here can't feed back into itself.
+  const homeEmbedKey = resolved.selectedRule?.embedKey ?? null
+
+  // Selecting an element points "Add custom styles in" at the file that already
+  // defines its selector, so a new declaration joins the rule that's there
+  // instead of landing in whichever stylesheet happens to be first in page
+  // order. An explicit pick still wins: the effect only re-runs when the element
+  // or the selector's home changes, not on every render. Left alone inside a
+  // component, where the source is pinned to that component's own embed.
+  useEffect(() => {
+    if (!homeEmbedKey || inComponentContext) return
+    setSourceSel((prev) => (prev === homeEmbedKey ? prev : homeEmbedKey))
+  }, [elementIdentity, activeSelector, homeEmbedKey, inComponentContext])
+
   // Every selector (with styles) that targets this element in the current context —
   // the element's own classes, stateful, and complex/ancestor selectors — for the
   // chip picker. Include the active selector even when it has no rule yet (a fresh
@@ -3333,7 +4022,15 @@ export default function EmbedEditor() {
     // them — so switching queries keeps the full list visible instead of dropping
     // selectors that only have styles elsewhere.
     const ownTokens = new Set(tokens.map((t) => t.name))
-    const list = styledSelectorsFor(model, nativeModel, currentContext)
+    // A chip is a selector that targets THIS element. One that hangs off a class the
+    // element no longer has doesn't any more — drop it now instead of leaving it in
+    // the well until the next resolve. Complex selectors are left to that resolve:
+    // the class may be an ancestor's, which this can't tell apart.
+    const list = styledSelectorsFor(model, nativeModel, currentContext).filter((sel) => {
+      if (!removedClasses.size) return true
+      const canon = canonicalCompound(sel.text)
+      return !(canon.simple && canon.tokens.some((tok) => removedClasses.has(tok)))
+    })
     // Show the active selector as a pending (dashed/outlined) chip while it has no rule
     // yet, so a freshly typed/picked selector stays visible until its first property
     // lands (then it becomes a solid styled chip). We show it for a complex/typed
@@ -3366,7 +4063,7 @@ export default function EmbedEditor() {
         const inQuery = !!currentContext.embedAtContext && s.inContext !== false && !!s.queryDisplay
         return inQuery ? { ...s, display: s.queryDisplay } : s
       })
-  }, [model, nativeModel, currentContext, activeSelector, selectedSelectorText, tokens, snapshot])
+  }, [model, nativeModel, currentContext, activeSelector, selectedSelectorText, tokens, snapshot, removedClasses])
 
   // Per-context dropdown info: embed hasStyles/combos (for the dot + auto-highlight)
   // plus whether the breakpoint carries native values.
@@ -3394,7 +4091,10 @@ export default function EmbedEditor() {
     const nextContext = styleContexts.find((entry) => entry.key === next)
     if (!nextContext || !model) return
     // Only selectors with styles IN this context (drop the dimmed other-context ones).
-    const styled = styledSelectorsFor(model, nativeModel, nextContext).filter((s) => s.inContext !== false)
+    // Never jump to a global selector (`:focus-visible`, `*`): editing one edits
+    // most of the site, and it isn't about this element.
+    const styled = styledSelectorsFor(model, nativeModel, nextContext)
+      .filter((s) => s.inContext !== false && !isGlobalSelector(s.text))
     if (!styled.length) return
     if (activeSelector && styled.some((s) => selectorsMatch(s.text, activeSelector))) return
     selectActiveSelector(styled[styled.length - 1].text)
@@ -3418,30 +4118,43 @@ export default function EmbedEditor() {
     // armed so we retry as they arrive, instead of committing to the unstyled combo.
     if (!styled.length) return
     pendingDefaultRef.current = false
+    // A global selector must never become the default. It matches nearly every
+    // element, so picking one would both force its (hidden) chip back on screen
+    // and point the style fields at a rule that isn't about this element —
+    // editing `:focus-visible` here would restyle the whole site. With only
+    // globals styling this element, the composed token selector stays the pick.
+    const local = styled.filter((s) => !isGlobalSelector(s.text))
+    if (!local.length) return
     // Use the FRESH default the effect just set (not `activeSelector`, which is still
     // the previous element's here). Keep it if it's already styled, else pick the strongest.
     const defaultSel = tokensToSelector(defaultTokensRef.current, tokens)
-    if (defaultSel && styled.some((s) => selectorsMatch(s.text, defaultSel))) return
+    if (defaultSel && local.some((s) => selectorsMatch(s.text, defaultSel))) return
     // Fall back to the FIRST applied class that has styles (the primary block class in
     // Lumos) rather than styled[last] — utility classes (u-*) sort last by name and
     // shouldn't win the default just because their specificity ties the base class.
-    const primaryStyled = defaultTokensRef.current
+    //
+    // Every class, not just the defaulted one: the default is now the first class
+    // alone, and if THAT one has no styles the next one along is still a better
+    // answer than a selector picked by specificity.
+    const primaryStyled = tokens
+      .filter((token) => token.kind === 'class')
+      .map((token) => token.name)
       .flatMap((tok) => {
-        const found = styled.find((s) => selectorsMatch(s.text, tokensToSelector([tok], tokens)))
+        const found = local.find((s) => selectorsMatch(s.text, tokensToSelector([tok], tokens)))
         return found ? [found] : []
       })[0]
     // Otherwise the FIRST selector in chip display order after the tag — the element's
     // own class/nesting selector (`.hero_component > .hero_paragraph`), not the highest-
     // specificity one (a foreign `:not(…) > :is(…)` shouldn't win the default).
     const classList = snapshot?.classList ?? []
-    const inChipOrder = [...styled]
+    const inChipOrder = [...local]
       .map((s) => ({ s, rank: selectorOrder(s.text, classList) }))
       .sort((a, b) =>
         a.rank[0] - b.rank[0] || a.rank[1] - b.rank[1] || a.rank[2] - b.rank[2] ||
         compareSpecificity(a.s.specificity, b.s.specificity) || a.s.text.localeCompare(b.s.text))
       .map((e) => e.s)
     const firstAfterTag = inChipOrder.find((s) => selectorOrder(s.text, classList)[0] > 0)
-    selectActiveSelector((primaryStyled ?? firstAfterTag ?? inChipOrder[0] ?? styled[styled.length - 1]).text)
+    selectActiveSelector((primaryStyled ?? firstAfterTag ?? inChipOrder[0] ?? local[local.length - 1]).text)
   }, [model, nativeModel, context, styleContexts, tokens, elementIdentity, snapshot, selectActiveSelector])
 
   // ── Native (Webflow class style) writes ──
@@ -3593,7 +4306,7 @@ export default function EmbedEditor() {
       if (!res.ok) {
         if (inComponentRef.current && !doc.source.fromComponent) {
           markPending(doc.source.key)
-          setStatus('Kept as unsaved — page embeds save when you exit the component.')
+          setStatus('Held — this rule lives in the page, so the canvas shows it once you leave the component.')
           return
         }
         setSaveError(res.error)
@@ -3636,7 +4349,7 @@ export default function EmbedEditor() {
         if (!res.ok) {
           if (inComponentRef.current && !doc.source.fromComponent) {
             markPending(doc.source.key)
-            setStatus('Kept as unsaved — page embeds save when you exit the component.')
+            setStatus('Held — this rule lives in the page, so the canvas shows it once you leave the component.')
             return
           }
           setSaveError(res.error)
@@ -3673,7 +4386,15 @@ export default function EmbedEditor() {
     if (r?.source === 'selected' && r.selectedOrigin) return r.selectedOrigin
     return canNative ? 'native' : 'embed'
   }
+  // Webflow's native API rejects hsl()/hsla(), so a value on its way THERE is
+  // normalized to rgb. Only there: this used to run on every write, which meant
+  // CSS written to a file or an embed — everything, in this app, where native
+  // styling is not available at all — could never come out as `hsl(…)`. Picking
+  // HSL in the colour picker changed the numbers on screen and left `rgb(224, 4,
+  // 4)` in the file, because the notation was converted back out on the way
+  // past.
   const nativeSetOrFallback = (index: number, prop: string, value: string, important: boolean) => {
+    value = hslaToRgba(value)
     void runNativeOp(async () => {
       let applied = false
       let reason = ''
@@ -3714,6 +4435,7 @@ export default function EmbedEditor() {
   // Webflow, write the property, then refresh (subsequent edits use the normal
   // native path once the style resolves). Falls back to an embed if creation fails.
   const nativeCreateAndSet = (className: string, prop: string, value: string, important: boolean) => {
+    value = hslaToRgba(value) // see nativeSetOrFallback
     void runNativeOp(async () => {
       let applied = false
       let created = false
@@ -3775,8 +4497,11 @@ export default function EmbedEditor() {
     return null
   }
   const setProp = (prop: string, value: string, important: boolean) => {
-    // Webflow's native API rejects hsl()/hsla() — normalize every write to rgb/rgba.
-    value = hslaToRgba(value)
+    // A gap or a padding cannot go below zero. Here rather than in the fields
+    // themselves: a value reaches this point from a typed edit, an arrow step, a
+    // drag, a variable pick and the add-property row, and a rule enforced in one
+    // field is a rule the other four ways around it don't have.
+    value = clampNonNegative(prop, value)
     // A commit is the new baseline: whatever a live write overwrote on the way here is
     // no longer what "revert" should restore.
     liveOriginRef.current.delete(prop)
@@ -3814,8 +4539,7 @@ export default function EmbedEditor() {
     // the hover-scrub's counterpart (a dropdown closed without picking, a field's edit
     // cancelled). Nothing to undo if no live write happened.
     if (value === null) { revertProp(prop); return }
-    // Normalize hsl()/hsla() → rgb/rgba first (Webflow's native API rejects hsl*).
-    value = hslaToRgba(value)
+    value = clampNonNegative(prop, value)
     // Don't push half-typed / invalid values live: Webflow's native API errors on
     // them and gets stuck. Keep the last valid value applied until a complete valid
     // one is typed; the blur commit still runs authoritatively.
@@ -3826,13 +4550,13 @@ export default function EmbedEditor() {
       const route = autoSelectForEdit()
       if (route && 'native' in route) {
         const handle = nativeModelRef.current?.styles[route.native]?.style
-        if (handle) nativeLiveSet(handle, prop, value, optionsFor(currentContext, stateKey))
+        if (handle) nativeLiveSet(handle, prop, hslaToRgba(value), optionsFor(currentContext, stateKey))
       }
       return
     }
     if (propLayer(prop) === 'native') {
       const handle = nativeHandle()
-      if (handle) { nativeLiveSet(handle, prop, value, optionsFor(currentContext, stateKey)); return }
+      if (handle) { nativeLiveSet(handle, prop, hslaToRgba(value), optionsFor(currentContext, stateKey)); return }
     }
     if (selectedRule) onLiveSetProp(selectedRule, prop, value, important)
   }
@@ -3920,14 +4644,17 @@ export default function EmbedEditor() {
         error={saveError}
         pending={
           pendingKeys.size
-            ? `${pendingKeys.size} change${pendingKeys.size === 1 ? '' : 's'} save when you exit the component`
+            ? `${pendingKeys.size} change${pendingKeys.size === 1 ? '' : 's'} to the page's styles — not on the canvas until you leave this component`
             : null
         }
       />
 
       {pendingKeys.size ? (
         <p className="embed-editor_pending-note">
-          {pendingKeys.size} unsaved page-embed change{pendingKeys.size === 1 ? '' : 's'} — will save when you exit the component.
+          {pendingKeys.size} change{pendingKeys.size === 1 ? '' : 's'} to the page's own &lt;style&gt;{' '}
+          block{pendingKeys.size === 1 ? '' : 's'} {pendingKeys.size === 1 ? 'is' : 'are'} held here —
+          the canvas won't show {pendingKeys.size === 1 ? 'it' : 'them'} until you leave this component,
+          and {pendingKeys.size === 1 ? 'it saves' : 'they save'} when you do.
         </p>
       ) : null}
 
@@ -3947,6 +4674,7 @@ export default function EmbedEditor() {
               snapshot={snapshot}
               selectedNames={selectedTokens}
               selectedSelector={activeSelector}
+              activePicked={selectedSelectorText != null}
               onSelectNames={selectTokens}
               resolved={resolved ?? EMPTY_RESOLVED}
               contexts={styleContexts}
@@ -3954,6 +4682,11 @@ export default function EmbedEditor() {
               context={context}
               onContext={onContextChange}
               onAddQuery={onAddQuery}
+              onRenameQuery={onRenameQuery}
+              queryUses={queryUses}
+              // The name the source pill below shows for the same file, so the
+              // two lines agree on what "ContentWrapper" is called.
+              sourceLabel={(sourceDoc && embedLabelByKey.get(sourceDoc.source.key)) ?? sourceDoc?.source.label ?? 'this file'}
               querySuggestions={querySuggestions}
               selectors={selectorChips}
               suggestions={selectorSuggestions}
@@ -3967,6 +4700,7 @@ export default function EmbedEditor() {
               sourceNote={sourceNote}
               nativeStyleName={nativeStyleName}
               loading={phase === 'scanning' || scanningMore}
+              resolving={resolving}
               busy={busy}
               pending={selectedRule ? pendingKeys.has(selectedRule.embedKey) : false}
               setProp={setProp}

@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
+import { useGapHover, type GapAxis } from './lib/gap-hover'
 import FieldLabel from './components/FieldLabel'
 import Select, { type SelectOption } from './components/Select'
 import SegmentedControl, { type SegmentedOption } from './components/SegmentedControl'
+import useScrub from './components/useScrub'
 import DisplayControl from './DisplayControl'
 import VariableConnect from './VariableConnect'
 import { handleArrowStep } from './lib/number-step'
 import { cap, readProp } from './lib/prop-read'
 import type { ParsedRule } from './lib/types'
+import { splitTopLevelSpaces } from './lib/background'
 
 // The Layout section of the style panel. The Display control is always shown;
 // the rest (flex vs grid controls) conditionally appears based on the current
@@ -117,7 +120,7 @@ function UnlockedIcon() {
 // Split a `gap` value into its row / column parts. One token → both equal (a
 // linked gap); two tokens → `gap: <row> <column>` per the CSS shorthand.
 function parseGap(value: string): { row: string; col: string } {
-  const parts = value.trim().split(/\s+/).filter(Boolean)
+  const parts = splitTopLevelSpaces(value).filter(Boolean)
   if (parts.length === 0) return { row: '', col: '' }
   if (parts.length === 1) return { row: parts[0], col: parts[0] }
   return { row: parts[0], col: parts[1] }
@@ -125,10 +128,12 @@ function parseGap(value: string): { row: string; col: string } {
 
 // A length field with live-as-you-type updates, a commit on blur, and ↑/↓ number
 // stepping — the shared gap-cell input (mirrors PropField, minus the property binding).
-function GapInput({ value, busy, ariaLabel, onLive, onCommit }: {
+function GapInput({ value, busy, ariaLabel, axes, onLive, onCommit }: {
   value: string
   busy: boolean
   ariaLabel: string
+  /** Which spaces on the page this field holds open — see gap-hover.ts. */
+  axes: GapAxis[]
   onLive: (value: string) => void
   onCommit: (value: string) => void
 }) {
@@ -142,14 +147,24 @@ function GapInput({ value, busy, ariaLabel, onLive, onCommit }: {
     cancelLive()
     liveTimer.current = window.setTimeout(() => { liveTimer.current = null; onLive(text) }, 100)
   }
+  const gapHover = useGapHover(axes, draft || value)
+  const scrub = useScrub({
+    value: draft,
+    disabled: busy,
+    onPreview: setDraft,
+    onInput: onLive,
+    onCommit: (text) => { setDraft(text); onCommit(text) },
+  })
   return (
     <VariableConnect ariaLabel={`Connect ${ariaLabel} to a variable`} disabled={busy} className="is-fill" prop="gap" onPick={(binding) => onCommit(binding)}>
       <input
+        {...scrub.input}
         className="u-input embed-editor_size-input"
         value={draft}
-        onChange={(event) => { setDraft(event.target.value); scheduleLive(event.target.value) }}
-        onFocus={() => { focused.current = true }}
-        onBlur={() => { focused.current = false; cancelLive(); onCommit(draft) }}
+        onChange={(event) => { setDraft(event.target.value); scheduleLive(event.target.value); gapHover.onValue(event.target.value) }}
+        {...gapHover.handlers}
+        onFocus={() => { focused.current = true; gapHover.onFocus() }}
+        onBlur={() => { focused.current = false; gapHover.onBlur(); cancelLive(); onCommit(draft) }}
         onKeyDown={(event) => {
           if (event.key === 'Enter') { event.currentTarget.blur(); return }
           const stepped = handleArrowStep(event)
@@ -207,15 +222,15 @@ function GapControl({ rule, busy, onSetProp, onClearProp, onLiveSetProp }: {
       </FieldLabel>
       <div className="embed-editor_gap">
         {linked ? (
-          <GapInput value={row} busy={busy} ariaLabel="Gap" onLive={(v) => writeLinked(v, true)} onCommit={(v) => writeLinked(v, false)} />
+          <GapInput value={row} busy={busy} ariaLabel="Gap" axes={['row', 'column']} onLive={(v) => writeLinked(v, true)} onCommit={(v) => writeLinked(v, false)} />
         ) : (
           <>
             <div className="embed-editor_gap-cell">
-              <GapInput value={col} busy={busy} ariaLabel="Column gap" onLive={(v) => writeSplit(row, v, true)} onCommit={(v) => writeSplit(row, v, false)} />
+              <GapInput value={col} busy={busy} ariaLabel="Column gap" axes={['column']} onLive={(v) => writeSplit(row, v, true)} onCommit={(v) => writeSplit(row, v, false)} />
               <span className="embed-editor_gap-caption">Columns</span>
             </div>
             <div className="embed-editor_gap-cell">
-              <GapInput value={row} busy={busy} ariaLabel="Row gap" onLive={(v) => writeSplit(v, col, true)} onCommit={(v) => writeSplit(v, col, false)} />
+              <GapInput value={row} busy={busy} ariaLabel="Row gap" axes={['row']} onLive={(v) => writeSplit(v, col, true)} onCommit={(v) => writeSplit(v, col, false)} />
               <span className="embed-editor_gap-caption">Rows</span>
             </div>
           </>

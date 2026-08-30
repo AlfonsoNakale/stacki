@@ -1,7 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { comparePageNames, isCollectionRoute, leadsFolders } from '../pageOrder.js';
 import Dropdown from '../ui/Dropdown.jsx';
 import {
   FileIcon,
+  CollectionIcon,
   PlusIcon,
   RefreshIcon,
   CloseIcon,
@@ -38,8 +40,8 @@ function countPages(node) {
   return n;
 }
 
-const stripExt = (base) => base.replace(/\.(astro|md)$/i, '');
-const extOf = (base) => (base.match(/\.(astro|md)$/i) || ['.astro'])[0];
+const stripExt = (base) => base.replace(/\.(astro|mdx?)$/i, '');
+const extOf = (base) => (base.match(/\.(astro|mdx?)$/i) || ['.astro'])[0];
 const dirOf = (rel) => rel.split('/').slice(0, -1).join('/');
 
 // Webflow-style pages tree: folders (create, rename, delete, collapse with
@@ -48,6 +50,8 @@ const dirOf = (rel) => rel.split('/').slice(0, -1).join('/');
 export default function PagesPanel({
   scan,
   currentPage,
+  injectedRoutes = [],
+  onSelectRoute,
   onSelect,
   onCreate,
   onDelete,
@@ -113,10 +117,15 @@ export default function PagesPanel({
 
   const renderPage = (page, depth) => {
     const isEditing = editing?.type === 'page' && editing.key === page.path;
+    // A bracketed route is one Astro renders per collection entry, so it gets
+    // the collection glyph rather than the page one.
+    const collection = isCollectionRoute(page.name);
     return (
       <div
         key={page.path}
-        className={`list-item ${currentPage?.path === page.path ? 'active' : ''}`}
+        className={`list-item ${collection ? 'collection' : ''} ${
+          currentPage?.path === page.path ? 'active' : ''
+        }`}
         style={{ paddingLeft: 8 + depth * 14 }}
         title={page.route}
         draggable={!isEditing}
@@ -134,7 +143,7 @@ export default function PagesPanel({
         }}
       >
         <span className="icon">
-          <FileIcon size={13} />
+          {collection ? <CollectionIcon size={13} /> : <FileIcon size={13} />}
         </span>
         {isEditing ? (
           <RenameInput initial={stripExt(page.base)} onCommit={(t) => commitPageRename(page, t)} />
@@ -211,24 +220,29 @@ export default function PagesPanel({
     );
   };
 
-  const renderChildren = (node, rel, depth) => (
-    <>
-      {[...node.dirs.entries()]
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([name, child]) =>
-          renderFolder(name, child, rel ? `${rel}/${name}` : name, depth)
-        )}
-      {node.pages
-        .slice()
-        .sort((a, b) => a.base.localeCompare(b.base))
-        .map((p) => renderPage(p, depth))}
-    </>
-  );
+  const renderChildren = (node, rel, depth) => {
+    const pages = node.pages.slice().sort((a, b) => comparePageNames(a.base, b.base));
+    // The folder's own page goes above the folders — see leadsFolders. The
+    // rest sit below them, which is where a page under a folder belongs.
+    const lead = pages.filter((p) => leadsFolders(p.base));
+    const rest = pages.filter((p) => !leadsFolders(p.base));
+    return (
+      <>
+        {lead.map((p) => renderPage(p, depth))}
+        {[...node.dirs.entries()]
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([name, child]) =>
+            renderFolder(name, child, rel ? `${rel}/${name}` : name, depth)
+          )}
+        {rest.map((p) => renderPage(p, depth))}
+      </>
+    );
+  };
 
   const searchResults = q
-    ? scan.pages.filter(
-        (p) => p.name.toLowerCase().includes(q) || p.route.toLowerCase().includes(q)
-      )
+    ? scan.pages
+        .filter((p) => p.name.toLowerCase().includes(q) || p.route.toLowerCase().includes(q))
+        .sort((a, b) => comparePageNames(a.name, b.name))
     : null;
 
   return (
@@ -276,11 +290,17 @@ export default function PagesPanel({
             {searchResults.map((p) => (
               <div
                 key={p.path}
-                className={`list-item ${currentPage?.path === p.path ? 'active' : ''}`}
+                className={`list-item ${isCollectionRoute(p.name) ? 'collection' : ''} ${
+                  currentPage?.path === p.path ? 'active' : ''
+                }`}
                 onClick={() => onSelect(p)}
               >
                 <span className="icon">
-                  <FileIcon size={13} />
+                  {isCollectionRoute(p.name) ? (
+                    <CollectionIcon size={13} />
+                  ) : (
+                    <FileIcon size={13} />
+                  )}
                 </span>
                 <span className="label">
                   {stripExt(p.name.split('/').pop())}
@@ -295,8 +315,40 @@ export default function PagesPanel({
         ) : (
           <>
             {renderChildren(tree, '', 0)}
-            {scan.pages.length === 0 && (scan.pageFolders || []).length === 0 && (
+            {scan.pages.length === 0 && (scan.pageFolders || []).length === 0 && !injectedRoutes.length && (
               <div className="props-empty">No pages yet. Create one with +.</div>
+            )}
+            {/* Routes the dev server serves that this project has no file for:
+                an integration injected them, and their source lives inside a
+                dependency. They can be previewed, and deliberately nothing
+                else — renaming or deleting a page you do not own is not a
+                thing the editor should offer. */}
+            {injectedRoutes.length > 0 && (
+              <div className="vars-table pages-injected">
+                <h3 className="list-item folder pages-injected-head">
+                  <span className="icon">
+                    <FolderIcon size={13} />
+                  </span>
+                  <span className="label">
+                    From {injectedRoutes[0].from ? injectedRoutes[0].from : 'integrations'}
+                  </span>
+                  <span className="sub">preview only</span>
+                </h3>
+                {injectedRoutes.map((r) => (
+                  <div
+                    key={r.route}
+                    className={`list-item ${currentPage?.route === r.route ? 'active' : ''}`}
+                    style={{ paddingLeft: 22 }}
+                    title={`${r.route}${r.entrypoint ? `\n${r.entrypoint}` : ''}`}
+                    onClick={() => onSelectRoute?.(r)}
+                  >
+                    <span className="icon">
+                      <FileIcon size={13} />
+                    </span>
+                    <span className="label">{r.route}</span>
+                  </div>
+                ))}
+              </div>
             )}
           </>
         )}

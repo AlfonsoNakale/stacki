@@ -2,12 +2,18 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { CSSProperties, ReactNode } from 'react'
 import FieldLabel from './components/FieldLabel'
+import { PropTip, ProvenanceLabel } from './components/PropTip'
+import { useHighlight } from './lib/computed-style'
 import { type SegmentedOption, HoverTooltip } from './components/SegmentedControl'
 import Select, { type SelectOption } from './components/Select'
+import useScrub, { type ScrubHandlers } from './components/useScrub'
 import { handleArrowStep } from './lib/number-step'
 import ProvenanceList from './ProvenanceList'
 import VariableConnect from './VariableConnect'
 import type { Contributor, ResolvedProp } from './lib/resolved'
+import { splitTopLevelSpaces } from './lib/background'
+import SegmentPill from './components/SegmentPill'
+import { commitInPlace } from './lib/commit-in-place'
 
 // The Size section of the style panel. Every control is always rendered (Webflow
 // parity), driven by the resolved model: a property is blue when the picked
@@ -60,28 +66,19 @@ const cap = (value: string) => value.charAt(0).toUpperCase() + value.slice(1)
 // clear menu; orange (another selector) → a button opening provenance; unset →
 // a dim caption. When the picked selector sets it but a more specific selector
 // wins, the label goes red + struck through and its menu names the winner.
-function SizeLabel({ label, prop, d, contributors, busy, onClear, onProvenance, onSelectSelector }: {
+function SizeLabel({ label, prop, d, contributors, busy, scrubProps, onClear, onProvenance, onSelectSelector }: {
   label: string
   prop: string
   d: Display
   contributors: Contributor[]
   busy: boolean
+  scrubProps?: ScrubHandlers
   onClear: () => void
   onProvenance: (prop: string, anchor: DOMRect) => void
   onSelectSelector: (selector: string, prop?: string) => void
 }) {
   if (d.present && !d.isSelected) {
-    return (
-      <button
-        type="button"
-        className="embed-editor_size-label embed-editor_prop-orange"
-        disabled={busy}
-        title="Set through another selector — click to see all"
-        onClick={(event) => onProvenance(prop, event.currentTarget.getBoundingClientRect())}
-      >
-        {label}
-      </button>
-    )
+    return <ProvenanceLabel label={label} props={[prop]} busy={busy} onProvenance={onProvenance} />
   }
   return (
     <FieldLabel
@@ -90,8 +87,10 @@ function SizeLabel({ label, prop, d, contributors, busy, onClear, onProvenance, 
       disabled={busy}
       onReset={onClear}
       resetLabel="Clear"
+      tooltip={<PropTip props={[prop]} />}
       title={d.overridden ? `Overridden by ${d.winnerSelector}` : undefined}
       menuNote={(close) => <ProvenanceList contributors={contributors} prop={prop} onSelect={(sel, p) => { onSelectSelector(sel, p); close() }} />}
+      scrubProps={scrubProps}
     >
       {label}
     </FieldLabel>
@@ -118,29 +117,41 @@ function LivePropField({ prop, label, placeholder, read, busy, setProp, clearPro
   }
   useEffect(() => cancelLive, [])
 
-  const scheduleLive = (text: string) => {
-    cancelLive()
-    liveTimer.current = window.setTimeout(() => {
-      liveTimer.current = null
-      const trimmed = text.trim()
-      if (!trimmed) return
-      const parsed = parseImportant(trimmed)
-      liveSetProp(prop, parsed.value, parsed.important)
-    }, 100)
+  // Undelayed live write for the scrub, which does its own throttling — a debounce reset
+  // by every mouse move would never fire mid-drag.
+  const liveNow = (text: string) => {
+    const trimmed = text.trim()
+    if (!trimmed) return
+    const parsed = parseImportant(trimmed)
+    liveSetProp(prop, parsed.value, parsed.important)
   }
 
-  const commit = () => {
-    const trimmed = draft.trim()
+  const scheduleLive = (text: string) => {
+    cancelLive()
+    liveTimer.current = window.setTimeout(() => { liveTimer.current = null; liveNow(text) }, 100)
+  }
+
+  const commit = (text = draft) => {
+    const trimmed = text.trim()
     if (!trimmed) { clearProp(prop); return }
     const parsed = parseImportant(trimmed)
     setProp(prop, parsed.value, parsed.important)
   }
 
+  const scrub = useScrub({
+    value: draft,
+    disabled: busy,
+    onPreview: setDraft,
+    onInput: liveNow,
+    onCommit: (text) => { setDraft(text); commit(text) },
+  })
+
   return (
     <>
-      <SizeLabel label={label} prop={prop} d={d} contributors={read(prop)?.contributors ?? []} busy={busy} onClear={() => clearProp(prop)} onProvenance={onProvenance} onSelectSelector={onSelectSelector} />
-      <VariableConnect ariaLabel={`Connect ${label} to a variable`} disabled={busy} prop={prop} onPick={(binding) => setProp(prop, binding, false)}>
+      <SizeLabel label={label} prop={prop} d={d} contributors={read(prop)?.contributors ?? []} busy={busy} scrubProps={scrub.label} onClear={() => clearProp(prop)} onProvenance={onProvenance} onSelectSelector={onSelectSelector} />
+      <VariableConnect code ariaLabel={`Connect ${label} to a variable`} disabled={busy} prop={prop} onPick={(binding) => setProp(prop, binding, false)}>
       <input
+        {...scrub.input}
         className="u-input embed-editor_size-input"
         data-prop={prop}
         value={draft}
@@ -148,7 +159,7 @@ function LivePropField({ prop, label, placeholder, read, busy, setProp, clearPro
         onFocus={() => { focused.current = true }}
         onBlur={() => { focused.current = false; cancelLive(); commit() }}
         onKeyDown={(event) => {
-          if (event.key === 'Enter') { event.currentTarget.blur(); return }
+          if (event.key === 'Enter') { commitInPlace(event.currentTarget); return }
           const stepped = handleArrowStep(event)
           if (!stepped) return
           event.preventDefault()
@@ -240,6 +251,7 @@ const OVERFLOW_SEGS: ReadonlyArray<{ value: string; icon?: ReactNode; label: str
   { value: 'auto', label: 'Auto' },
 ]
 const OVERFLOW_SUPPORTED = new Set(OVERFLOW_SEGS.map((seg) => seg.value))
+const OVERFLOW_VALUES = OVERFLOW_SEGS.map((seg) => seg.value)
 
 // Editable free-value field (unset, var(), …) shown in the overflow bar's custom mode.
 function OverflowCustomInput({ value, busy, inputRef, onCommit, onLiveCommit, onClear, ariaLabel = 'Overflow value', placeholder = 'custom value' }: {
@@ -282,7 +294,7 @@ function OverflowCustomInput({ value, busy, inputRef, onCommit, onLiveCommit, on
       onChange={(event) => { setDraft(event.target.value); scheduleLive(event.target.value) }}
       onFocus={() => { focused.current = true }}
       onBlur={() => { focused.current = false; cancelLive(); commit() }}
-      onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }}
+      onKeyDown={(event) => { if (event.key === 'Enter') commitInPlace(event.currentTarget) }}
       disabled={busy}
       spellCheck={false}
       placeholder={placeholder}
@@ -362,6 +374,7 @@ function OverflowBar({ value, busy, onCommit, onLiveCommit, onClear }: {
 
   return (
     <div ref={rootRef} className={`embed-editor_display ${customMode ? 'is-custom' : ''}`} role="group" aria-label="Overflow">
+      <SegmentPill />
       {customMode ? (
         <OverflowCustomInput value={value} busy={busy} inputRef={inputRef} onCommit={onCommit} onLiveCommit={onLiveCommit} onClear={onClear} />
       ) : (
@@ -429,7 +442,9 @@ function OverflowRow({ label, prop, d, contributors, fallback, toggle, busy, set
   onProvenance: (prop: string, anchor: DOMRect) => void
   onSelectSelector: (selector: string, prop?: string) => void
 }) {
-  const value = d.present ? d.value.toLowerCase() : fallback
+  // Nothing authored here → the page's own computed overflow, then the caller's
+  // fallback (the shorthand's value, for the X / Y rows).
+  const value = useHighlight(d.present ? d.value.toLowerCase() : (fallback || ''), prop, OVERFLOW_VALUES, '')
   const labelEl = (
     <SizeLabel
       label={label}
@@ -597,6 +612,7 @@ function BoxSizingBar({ value, busy, onCommit, onLiveCommit, onClear }: {
 
   return (
     <div ref={rootRef} className={`embed-editor_display ${customMode ? 'is-custom' : ''}`} role="group" aria-label="Box sizing">
+      <SegmentPill />
       {customMode ? (
         <OverflowCustomInput value={value} busy={busy} inputRef={inputRef} onCommit={onCommit} onLiveCommit={onLiveCommit} onClear={onClear} ariaLabel="Box sizing value" />
       ) : (
@@ -693,9 +709,17 @@ function RatioNumberInput({ value, busy, ariaLabel, onLive, onCommit }: {
   const focused = useRef(false)
   useEffect(() => { if (!focused.current) setDraft(value) }, [value])
   const sanitize = (raw: string) => raw.replace(/[^\d.]/g, '')
+  const scrub = useScrub({
+    value: draft,
+    disabled: busy,
+    onPreview: setDraft,
+    onInput: onLive,
+    onCommit: (text) => { setDraft(text); onCommit(text) },
+  })
 
   return (
     <input
+      {...scrub.input}
       className="u-input embed-editor_ratio-input"
       value={draft}
       inputMode="decimal"
@@ -703,7 +727,7 @@ function RatioNumberInput({ value, busy, ariaLabel, onLive, onCommit }: {
       onFocus={() => { focused.current = true }}
       onBlur={() => { focused.current = false; onCommit(draft) }}
       onKeyDown={(event) => {
-        if (event.key === 'Enter') { event.currentTarget.blur(); return }
+        if (event.key === 'Enter') { commitInPlace(event.currentTarget); return }
         const stepped = handleArrowStep(event)
         if (!stepped) return
         event.preventDefault()
@@ -723,10 +747,14 @@ function RatioNumberInput({ value, busy, ariaLabel, onLive, onCommit }: {
 // Free-text value field for the Ratio "Other" mode — mirrors the Display/Overflow
 // custom fields. Any value (unset, var(--x), calc(…), …) live-updates as you type
 // and commits on blur; emptying it clears the property. Focuses itself when the
-// mode is first entered (once the seeding write clears `busy`).
-function RatioOtherInput({ value, busy, onCommit, onLiveCommit, onClear, ariaLabel = 'Aspect ratio value', placeholder = 'unset, var(--x)…' }: {
+// mode is first entered (once the seeding write clears `busy`) — and only then.
+export function RatioOtherInput({ value, busy, prop, autoFocus = false, onCommit, onLiveCommit, onClear, ariaLabel = 'Aspect ratio value', placeholder = 'unset, var(--x)…' }: {
   value: string
   busy: boolean
+  /** The CSS property being edited — filters the variable list to what fits it. */
+  prop: string
+  /** Take the caret — true only when this mode was just chosen from the menu. */
+  autoFocus?: boolean
   onCommit: (value: string, important: boolean) => void
   onLiveCommit: (value: string, important: boolean) => void
   onClear: () => void
@@ -743,12 +771,18 @@ function RatioOtherInput({ value, busy, onCommit, onLiveCommit, onClear, ariaLab
   const cancelLive = () => { if (liveTimer.current != null) { window.clearTimeout(liveTimer.current); liveTimer.current = null } }
   useEffect(() => cancelLive, [])
 
+  // Only when this field was ASKED for — picking "Other" from the menu, where
+  // the next thing anyone does is type. It used to focus on mount whatever
+  // brought it here, and the other thing that brings it here is selecting an
+  // element whose ratio is already a free value (`var(--_visual-ratio)`): the
+  // field appeared, took the caret, and selected its text, so clicking an
+  // element on the canvas left you typing into the style panel.
   useEffect(() => {
-    if (didFocus.current || busy) return
+    if (!autoFocus || didFocus.current || busy) return
     didFocus.current = true
     inputRef.current?.focus()
     inputRef.current?.select()
-  }, [busy])
+  }, [autoFocus, busy])
 
   const scheduleLive = (text: string) => {
     cancelLive()
@@ -768,7 +802,19 @@ function RatioOtherInput({ value, busy, onCommit, onLiveCommit, onClear, ariaLab
     onCommit(parsed.value, parsed.important)
   }
 
+  // Wrapped like every other field in the panel: a `var(--x)` in here is the
+  // same thing it is in Width or Gap, and it should read as the same chip. This
+  // one was a bare <input>, so the one place a variable is MOST likely to be —
+  // the field you land in precisely because the value is not a plain one — was
+  // the one place it was shown as raw text.
   return (
+    <VariableConnect
+      code
+      ariaLabel={`Connect ${ariaLabel} to a variable`}
+      disabled={busy}
+      prop={prop}
+      onPick={(binding) => onCommit(binding, false)}
+    >
     <input
       ref={inputRef}
       className="u-select-custom-input"
@@ -776,12 +822,13 @@ function RatioOtherInput({ value, busy, onCommit, onLiveCommit, onClear, ariaLab
       onChange={(event) => { setDraft(event.target.value); scheduleLive(event.target.value) }}
       onFocus={() => { focused.current = true }}
       onBlur={() => { focused.current = false; cancelLive(); commit() }}
-      onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }}
+      onKeyDown={(event) => { if (event.key === 'Enter') commitInPlace(event.currentTarget) }}
       disabled={busy}
       spellCheck={false}
       placeholder={placeholder}
       aria-label={ariaLabel}
     />
+    </VariableConnect>
   )
 }
 
@@ -793,6 +840,9 @@ function AspectRatioField({ read, busy, setProp, clearProp, liveSetProp, onProve
   // value happens to match a preset (1 / 1 vs Square) — until a preset/Auto is
   // picked. Everything else derives straight from the value.
   const [forced, setForced] = useState<'custom' | 'other' | null>(null)
+  // Whether "Other" was just chosen here, as opposed to the value simply being
+  // one the bar can't show. Only the first of those wants the caret.
+  const askedForOther = useRef(false)
   const key = forced ?? derivedKey
   const parsed = parseRatio(current) ?? { w: '1', h: '1' }
 
@@ -806,6 +856,7 @@ function AspectRatioField({ read, busy, setProp, clearProp, liveSetProp, onProve
   const onSelect = (choice: string) => {
     // "Auto" writes the explicit `aspect-ratio: auto` (the CSS initial value);
     // removing the property is the label's Clear action, not this.
+    askedForOther.current = false
     if (choice === 'auto') { setForced(null); setProp('aspect-ratio', 'auto', false); return }
     if (choice === 'custom') {
       setForced('custom')
@@ -815,6 +866,7 @@ function AspectRatioField({ read, busy, setProp, clearProp, liveSetProp, onProve
     }
     if (choice === 'other') {
       setForced('other')
+      askedForOther.current = true
       // Keep an existing free value; otherwise seed with `unset` to type over.
       if (ratioKeyOf(current) !== 'other') setProp('aspect-ratio', 'unset', false)
       return
@@ -845,6 +897,8 @@ function AspectRatioField({ read, busy, setProp, clearProp, liveSetProp, onProve
             <RatioOtherInput
               value={d.present ? (d.important ? `${current} !important` : current) : ''}
               busy={busy}
+              prop="aspect-ratio"
+              autoFocus={askedForOther.current}
               onCommit={(value, important) => setProp('aspect-ratio', value, important)}
               onLiveCommit={(value, important) => liveSetProp('aspect-ratio', value, important)}
               onClear={() => { setForced(null); clearProp('aspect-ratio') }}
@@ -918,9 +972,11 @@ function DotsIcon() {
   )
 }
 
-// A position offset field: the input holds the RAW value, so any unit works (10px,
-// 50%, unset, var(--x)…). A "%" hint sits INSIDE the field, shown only while the value
-// is a bare number (or empty) — a bare number commits as a percentage.
+// A position offset field. The same field the rest of the panel uses — it was its
+// own smaller control with a bordered box and an inline "%" chip, which made this
+// popup read as a different app. The input holds the RAW value, so any unit works
+// (10px, 50%, unset, var(--x)…); a bare number still commits as a percentage, which
+// is what the placeholder says.
 function PosInput({ value, busy, label, onLive, onCommit }: {
   value: string; busy: boolean; label: string; onLive: (v: string) => void; onCommit: (v: string) => void
 }) {
@@ -929,13 +985,26 @@ function PosInput({ value, busy, label, onLive, onCommit }: {
   useEffect(() => { if (!focused.current) setDraft(value) }, [value])
   const isBareNum = (s: string) => /^-?[\d.]+$/.test(s.trim())
   const norm = (t: string) => { const s = t.trim(); return s === '' ? '' : isBareNum(s) ? `${s}%` : s }
-  const showPct = draft.trim() === '' || isBareNum(draft)
+  const scrub = useScrub({
+    value: draft,
+    disabled: busy,
+    onPreview: setDraft,
+    onInput: (text) => onLive(norm(text)),
+    onCommit: (text) => { setDraft(text); onCommit(norm(text)) },
+  })
   return (
-    <div className={`embed-editor_imgfit-num ${busy ? 'is-disabled' : ''}`}>
+    <VariableConnect
+      code
+      ariaLabel={`Connect ${label} to a variable`}
+      disabled={busy}
+      prop="object-position"
+      onPick={(binding) => onCommit(binding)}
+    >
       <input
-        className="embed-editor_imgfit-input"
+        {...scrub.input}
+        className="u-input embed-editor_size-input"
         value={draft}
-        placeholder="50"
+        placeholder="50%"
         aria-label={label}
         disabled={busy}
         spellCheck={false}
@@ -943,7 +1012,7 @@ function PosInput({ value, busy, label, onLive, onCommit }: {
         onFocus={() => { focused.current = true }}
         onBlur={() => { focused.current = false; onCommit(norm(draft)) }}
         onKeyDown={(e) => {
-          if (e.key === 'Enter') { e.currentTarget.blur(); return }
+          if (e.key === 'Enter') { commitInPlace(e.currentTarget); return }
           const stepped = handleArrowStep(e)
           if (!stepped) return
           e.preventDefault()
@@ -954,8 +1023,7 @@ function PosInput({ value, busy, label, onLive, onCommit }: {
           onLive(norm(stepped.text))
         }}
       />
-      {showPct ? <span className="embed-editor_imgfit-unit" aria-hidden="true">%</span> : null}
-    </div>
+    </VariableConnect>
   )
 }
 
@@ -996,14 +1064,18 @@ function ImageFitField({ read, busy, setProp, clearProp, liveSetProp, onProvenan
   const fitValue = fit.value.trim().toLowerCase()
   const knownFit = FIT_OPTIONS.some((o) => o.value === fitValue)
   const fitCustom = forceCustom || (fit.present && fitValue !== '' && !knownFit)
+  // Chosen from the menu, as opposed to a value the list can't show — the field
+  // is the same either way, but only the first wants the caret.
+  const askedForCustom = useRef(false)
   const pickFit = (v: string) => {
-    if (v === FIT_CUSTOM) { setForceCustom(true); setProp('object-fit', 'unset', false); return }
+    if (v === FIT_CUSTOM) { setForceCustom(true); askedForCustom.current = true; setProp('object-fit', 'unset', false); return }
+    askedForCustom.current = false
     setForceCustom(false)
     setProp('object-fit', v, false)
   }
 
   const posRaw = posD.present ? posD.value.trim() : ''
-  const posParts = posRaw.split(/\s+/).filter(Boolean)
+  const posParts = splitTopLevelSpaces(posRaw).filter(Boolean)
   const px = posParts[0] ?? ''
   const py = posParts[1] ?? ''
   const posSet = posRaw !== '' && posRaw.toLowerCase() !== 'unset'
@@ -1032,6 +1104,8 @@ function ImageFitField({ read, busy, setProp, clearProp, liveSetProp, onProvenan
               <RatioOtherInput
                 value={fit.present ? (fit.important ? `${fit.value} !important` : fit.value) : ''}
                 busy={busy}
+                prop="object-fit"
+                autoFocus={askedForCustom.current}
                 ariaLabel="Object fit value"
                 onCommit={(v, important) => setProp('object-fit', v, important)}
                 onLiveCommit={(v, important) => liveSetProp('object-fit', v, important)}
@@ -1067,6 +1141,7 @@ function ImageFitField({ read, busy, setProp, clearProp, liveSetProp, onProvenan
               disabled={busy}
               onReset={() => clearProp('object-position')}
               resetLabel="Clear"
+              tooltip={<PropTip props={['object-position']} />}
             >
               Position
             </FieldLabel>
@@ -1083,19 +1158,24 @@ function ImageFitField({ read, busy, setProp, clearProp, liveSetProp, onProvenan
                 />
               )))}
             </div>
+            {/* Divs, not labels. The field these hold is the rich token editor with
+                the real <input> hidden behind it — and a <label> hands a click to the
+                control it wraps, so clicking into the editor focused that hidden input
+                instead and the caret vanished the instant it appeared. The inputs carry
+                their own aria-label. */}
             <div className="embed-editor_bg-posfields">
-              <label className="embed-editor_bg-posfield">
+              <div className="embed-editor_bg-posfield">
                 <span className="embed-editor_bg-posfield-cap">Left</span>
                 <PosInput value={px} busy={busy} label="Object position left"
                   onLive={(v) => writePos(`${v || '50%'} ${py || '50%'}`, true)}
                   onCommit={(v) => writePos((v || py) ? `${v || '50%'} ${py || '50%'}` : '', false)} />
-              </label>
-              <label className="embed-editor_bg-posfield">
+              </div>
+              <div className="embed-editor_bg-posfield">
                 <span className="embed-editor_bg-posfield-cap">Top</span>
                 <PosInput value={py} busy={busy} label="Object position top"
                   onLive={(v) => writePos(`${px || '50%'} ${v || '50%'}`, true)}
                   onCommit={(v) => writePos((px || v) ? `${px || '50%'} ${v || '50%'}` : '', false)} />
-              </label>
+              </div>
             </div>
           </div>
           </div>

@@ -11,8 +11,11 @@ export function snapshotTokens(snapshot: ElementSnapshot | undefined): ClassToke
   if (!snapshot) return []
   const tokens: ClassToken[] = []
 
-  // Tag first (every element has one).
-  const tag = snapshot.tag ?? (snapshot.webflowType ? snapshot.webflowType.toLowerCase() : null)
+  // Tag first — when there is one. A component instance renders markup this
+  // side can't see, so it has no tag of its own, and the node's KIND is not a
+  // substitute: `component.card` is a selector for a `<component>` element,
+  // which no page has. Such an element is matched by its classes alone.
+  const tag = snapshot.tag
   if (tag) tokens.push({ name: `tag:${tag}`, label: tag, kind: 'tag' })
 
   // Then classes, in element order — each shown in its Webflow CSS form (`Div Block`
@@ -59,6 +62,27 @@ export function selectorToClassTokens(selectorText: string, tokens: ClassToken[]
   }
   // Every class the selector names must exist on the element, or we can't select it.
   return matched.size === wanted.size && picked.length ? picked : null
+}
+
+/**
+ * Which tokens a newly selected element is styled through, before anyone picks:
+ * its FIRST class, else its last data attribute, else its tag.
+ *
+ * The first class, not all of them. Every class joined is Webflow's model, where
+ * a combo is itself a thing to style — but writing CSS to a file it means the
+ * first property set on an element creates
+ * `.layout.card.theme-dark.flex-grow.theme-brand { … }`, and since the combo
+ * then counts as a styled selector, everything after it lands there too: a rule
+ * of five classes that nothing else can reuse, assembled a property at a time
+ * from a default nobody chose. A combo is a deliberate act; it takes picking
+ * that chip.
+ */
+export function defaultSelectorTokens(tokens: ClassToken[]): string[] {
+  const classes = tokens.filter((token) => token.kind === 'class')
+  if (classes.length) return [classes[0].name]
+  const attrs = tokens.filter((token) => token.kind === 'attribute')
+  if (attrs.length) return [attrs[attrs.length - 1].name]
+  return tokens.length ? [tokens[0].name] : []
 }
 
 /** Compose a CSS selector from selected token names, honoring token order. */

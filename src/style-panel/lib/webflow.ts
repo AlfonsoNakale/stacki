@@ -18,7 +18,7 @@
 // just text with CSS regions in it, and a stylesheet is that with one region
 // covering the whole file.
 
-import { collectRules } from './css'
+import { collectRules, renderEmbed, splitEmbed } from './css'
 import postcss from 'postcss'
 import { findNode, getHost, onHostChange, propText, walkNodes, type HostNode } from './host'
 import type { StateKey } from './resolved'
@@ -31,6 +31,7 @@ import type {
   StyleRegion,
 } from './types'
 import type { MatchTarget, TreeView } from './selectors'
+import { hasCanvas, queryCanvas } from '../../canvasQuery.js'
 import type { NativeStyleOptions } from './native-styles'
 
 type AnyEl = unknown
@@ -96,8 +97,51 @@ export function webflowApi() {
 const nodeById = (id: string | null): HostNode | null =>
   id ? findNode(getHost().nodes, id) : null
 
-const classTokens = (node: HostNode | null): string[] =>
-  propText(node, 'class').split(/\s+/).filter(Boolean)
+// A node's classes. `class="a b"` is readable straight from the source, but
+// `class:list={[…]}` / `class={expr}` are expressions with no class text at
+// all — for those the only truth is what the page rendered. The preview reports
+// that for the selected element, so merge it in: a static class inside a
+// class:list shows up, and a computed one (`gap-${gap}`) shows the value THIS
+// instance resolved to. Source order first, then anything only the DOM knows.
+// The string literals in an expression-valued class attribute. `class:list={[
+// "container", gap !== "8" && `gap-${gap}`, ...rest ]}` yields `container` — a
+// literal is a class this element always has, so it can be shown straight away
+// instead of waiting on the canvas. Template literals with a `${}` hole are
+// skipped: only the rendered element knows what they became. Values that aren't
+// class-shaped (selectors, URLs, sentences) are dropped.
+const CLASS_RE = /^[A-Za-z_-][A-Za-z0-9_-]*$/
+const literalClasses = (node: HostNode | null, name: string): string[] => {
+  const prop = node?.props?.[name]
+  if (!prop || prop.type !== 'expr') return []
+  const out: string[] = []
+  for (const [, quote, body] of String(prop.value ?? '').matchAll(/(['"`])([^'"`]*)\1/g)) {
+    if (quote === '`' && body.includes('${')) continue
+    for (const tok of body.split(/\s+/)) if (CLASS_RE.test(tok)) out.push(tok)
+  }
+  return out
+}
+
+const classTokens = (node: HostNode | null): string[] => {
+  // A class can be named in more than one place (`class` plus `class:list`, or
+  // twice within one list) — the element still carries it once.
+  const authored = [
+    ...new Set([
+      ...propText(node, 'class').split(/\s+/).filter(Boolean),
+      // `class:list={[…]}`, and `class={…}` when it's an expression.
+      ...literalClasses(node, 'class:list'),
+      ...literalClasses(node, 'class'),
+    ]),
+  ]
+  const host = getHost()
+  // Rendered classes describe the selected element only — attributing them to
+  // any other node (an ancestor being matched, say) would be wrong.
+  if (!node || node.id !== host.selectedId) return authored
+  const out = [...authored]
+  for (const cls of host.renderedClasses || []) {
+    if (cls && !out.includes(cls)) out.push(cls)
+  }
+  return out
+}
 
 export async function buildSnapshot(el: AnyEl): Promise<ElementSnapshot> {
   const node = typeof el === 'string' ? nodeById(el) : (el as HostNode)
@@ -137,8 +181,12 @@ export type EmbedSource = {
   order: number
   element: AnyEl
   instance?: AnyEl
-  /** Where the CSS lives — the panel writes back through this. */
-  origin: { kind: 'file'; path: string } | { kind: 'node'; nodeId: string }
+  /** Where the CSS lives — the panel writes back through this. `astro` is a
+   *  component file whose `<style is:global>` blocks are edited in place. */
+  origin:
+    | { kind: 'file'; path: string }
+    | { kind: 'node'; nodeId: string }
+    | { kind: 'astro'; path: string }
 }
 
 export type EmbedDoc = {
@@ -201,6 +249,26 @@ function styleSources(): EmbedSource[] {
     })
   }
 
+  // Every OTHER component's `<style is:global>`. Those rules are unhashed, so
+  // they style what the page renders no matter which file the selection came
+  // from — without this, styling a component instance from a page shows an
+  // empty panel even though the element is clearly styled on the canvas. The
+  // open file is skipped: its own <style> blocks come from the model below,
+  // and reading it twice would let the two copies write over each other.
+  for (const f of host.astroFiles) {
+    if (host.openFilePath && f.path === host.openFilePath) continue
+    out.push({
+      key: `astro:${f.path}`,
+      label: f.name,
+      classNames: [],
+      fromComponent: true,
+      componentName: f.name.replace(/\.astro$/i, ''),
+      order: order++,
+      element: f.path,
+      origin: { kind: 'astro', path: f.path },
+    })
+  }
+
   walkNodes(host.nodes, (n) => {
     if (n.kind !== 'raw' || n.name !== 'style') return
     const isGlobal = !!n.props?.['is:global']
@@ -250,7 +318,7 @@ export function scanHasElement(scan: EmbedScan, selected: AnyEl): boolean {
 // and kinds whose element count can't be known without running the page.
 // Everything else (text, comment, raw-line) renders no element at all.
 const ELEMENT_KINDS = new Set(['element', 'component', 'raw'])
-const OPAQUE_COUNT_KINDS = new Set(['map', 'expr', 'chunk-group'])
+const OPAQUE_COUNT_KINDS = new Set(['map', 'expr', 'chunk-group', 'cond', 'branch'])
 
 function buildTreeMaps() {
   const parentByKey = new Map<string, string>()
@@ -274,7 +342,31 @@ function buildTreeMaps() {
 // holds only its inner text — the app keeps the tag itself in the model. So
 // each is one region spanning the whole text. (A Webflow embed was HTML with
 // <style> blocks inside it, which is why the original had to split it.)
+/** Is this `<style>` block global — i.e. does it style the page rather than
+ *  only its own component? A block with no opening tag recorded (a stylesheet)
+ *  is global by definition. */
+function isGlobalRegion(region: StyleRegion): boolean {
+  return region.openTag == null || /\bis:global\b/.test(region.openTag)
+}
+
 function docForSource(source: EmbedSource, code: string): EmbedDoc {
+  // A component file is markup with <style> blocks in it — the shape the embed
+  // model was built for. Only its global blocks are parsed; a scoped block is
+  // left as untouched text, so renderEmbed writes it back verbatim and
+  // rebuildRules (which skips region.root === null) never offers its rules for
+  // an element in another component.
+  if (source.origin.kind === 'astro') {
+    const { segments, regions } = splitEmbed(code)
+    for (const region of regions) {
+      if (!isGlobalRegion(region)) continue
+      try {
+        region.root = postcss.parse(region.css)
+      } catch (err) {
+        region.parseError = String((err as Error)?.message || err)
+      }
+    }
+    return { source, code, segments, regions }
+  }
   const region: StyleRegion = { start: 0, end: code.length, css: code, root: null }
   try {
     region.root = postcss.parse(code)
@@ -285,7 +377,7 @@ function docForSource(source: EmbedSource, code: string): EmbedDoc {
 }
 
 async function readSource(source: EmbedSource): Promise<string> {
-  if (source.origin.kind === 'file') {
+  if (source.origin.kind === 'file' || source.origin.kind === 'astro') {
     const res = await window.avb.readStyleFile(source.origin.path)
     return res?.css ?? ''
   }
@@ -293,20 +385,42 @@ async function readSource(source: EmbedSource): Promise<string> {
   return String(node?.inner ?? '')
 }
 
+/** The text this doc's source file should now hold. A stylesheet or a <style>
+ *  node is all CSS; a component file is its markup with only the edited
+ *  regions re-stringified. */
+function serializeDoc(doc: EmbedDoc): string {
+  if (doc.source.origin.kind === 'astro') return renderEmbed(doc.segments, doc.regions)
+  return doc.regions[0]?.root?.toString() ?? doc.regions[0]?.css ?? ''
+}
+
+/**
+ * Read each source's code and parse it into live regions. The reads run
+ * concurrently — each is an IPC round trip to the main process, and waiting
+ * for one before starting the next made the scan linear in the number of
+ * stylesheets and global-style components the project has. `onDoc` fires as
+ * each lands so callers can stream; the returned arrays stay in source order,
+ * which is cascade order.
+ */
 export async function loadEmbedDocs(
   sources: EmbedSource[],
   onDoc?: (doc: EmbedDoc) => void,
 ): Promise<{ docs: EmbedDoc[]; errors: Array<{ label: string; error: string }> }> {
+  const loaded = await Promise.all(
+    sources.map(async (source) => {
+      try {
+        const doc = docForSource(source, await readSource(source))
+        onDoc?.(doc)
+        return { doc, error: null }
+      } catch (err) {
+        return { doc: null, error: { label: source.label, error: String((err as Error)?.message || err) } }
+      }
+    }),
+  )
   const docs: EmbedDoc[] = []
   const errors: Array<{ label: string; error: string }> = []
-  for (const source of sources) {
-    try {
-      const doc = docForSource(source, await readSource(source))
-      docs.push(doc)
-      onDoc?.(doc)
-    } catch (err) {
-      errors.push({ label: source.label, error: String((err as Error)?.message || err) })
-    }
+  for (const entry of loaded) {
+    if (entry.doc) docs.push(entry.doc)
+    if (entry.error) errors.push(entry.error)
   }
   return { docs, errors }
 }
@@ -318,22 +432,62 @@ export async function writeEmbedDoc(
    *  so the canvas doesn't wait out a typing debounce for a single click. */
   live = false,
 ): Promise<{ ok: true; code: string } | { ok: false; error: string }> {
-  // One region covering the whole text, so re-stringify it directly rather
-  // than splicing — nothing outside the CSS can be introduced that way.
-  const code = doc.regions[0]?.root?.toString() ?? doc.regions[0]?.css ?? ''
+  const code = serializeDoc(doc)
+  // What the file held before this write — the undo target, captured before
+  // doc.code is advanced below.
+  const before = doc.code
   try {
-    if (doc.source.origin.kind === 'file') {
-      await window.avb.writeStyleFile({ filePath: doc.source.origin.path, css: code })
+    if (doc.source.origin.kind === 'file' || doc.source.origin.kind === 'astro') {
+      const { path } = doc.source.origin
+      await window.avb.writeStyleFile({ filePath: path, css: code })
+      // A <style> node's write goes through the page model, which the app
+      // already snapshots — only stylesheets need their own history entry.
+      if (before !== code) {
+        getHost().recordUndo?.({
+          label: `styles in ${doc.source.label}`,
+          // One step per file per burst: a slider drag writes on every tick.
+          coalesceKey: `css:${path}`,
+          undo: () => writeStyleFileAndReload(doc, path, before),
+          redo: () => writeStyleFileAndReload(doc, path, code),
+        })
+      }
     } else {
       const write = getHost().writeStyleNode
       if (!write) return { ok: false, error: 'No page open to write into.' }
-      write(doc.source.origin.nodeId, code, !live)
+      // A <style> block belonging to the page, while a component is open: there
+      // is no such node in the model being edited. The write used to find
+      // nothing and quietly do nothing, leaving the panel to report a save the
+      // canvas would never show.
+      if (write(doc.source.origin.nodeId, code, !live) === false) {
+        return { ok: false, error: "Couldn't find that <style> block in the open file." }
+      }
     }
     doc.code = code
     return { ok: true, code }
   } catch (err) {
     return { ok: false, error: String((err as Error)?.message || err) }
   }
+}
+
+// Undo/redo rewrites a stylesheet behind the panel's back, so the doc it will
+// write from next has to be brought back in step — otherwise the next edit
+// would serialize the stale AST and quietly resurrect what was just undone.
+const docsReloaded = new Set<() => void>()
+export function onDocsReloaded(fn: () => void): () => void {
+  docsReloaded.add(fn)
+  return () => { docsReloaded.delete(fn) }
+}
+
+async function writeStyleFileAndReload(doc: EmbedDoc, path: string, text: string): Promise<void> {
+  await window.avb.writeStyleFile({ filePath: path, css: text })
+  // Re-derive the doc from what the file now holds, the same way it was first
+  // read — for a component file that means re-splitting its markup, not
+  // treating the whole file as one region of CSS.
+  const fresh = docForSource(doc.source, text)
+  doc.segments = fresh.segments
+  doc.regions = fresh.regions
+  doc.code = text
+  for (const fn of docsReloaded) fn()
 }
 
 export function rebuildRules(docs: EmbedDoc[]): ParsedRule[] {
@@ -368,6 +522,9 @@ export function rebuildRules(docs: EmbedDoc[]): ParsedRule[] {
 export async function navigateToEmbed(
   source: EmbedSource,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (source.origin.kind === 'astro') {
+    return { ok: false, error: `These styles live in ${source.label} — open that component to see them in the tree.` }
+  }
   if (source.origin.kind !== 'node') {
     return { ok: false, error: `${source.label} is a stylesheet — open it from the Assets panel.` }
   }
@@ -377,11 +534,117 @@ export async function navigateToEmbed(
   return { ok: true }
 }
 
+// ───────────────────────── Asking the rendered page ─────────────────────────
+
+// State pseudo-classes describe a moment, not an element: `.card:hover` only
+// matches while the pointer is there, but the panel is asking "does this rule
+// target this element", which it does whether or not it's hovered right now.
+// Stripped before asking, and the answer stored under the original text.
+// Longest name first, and `(?![\w-])` rather than `\b` to close the trap that
+// `-` is a non-word character: `:focus\b` happily matches inside
+// `:focus-visible`, leaving the nonsense selector `a-visible`.
+const STATE_PSEUDO_RE =
+  /:(?:focus-visible|focus-within|focus|hover|active|visited|target|checked|indeterminate|default|disabled|enabled|placeholder-shown|autofill|user-invalid|user-valid|read-only|read-write|open)(?![\w-])/g
+const PSEUDO_ELEMENT_RE =
+  /::?(?:before|after|first-line|first-letter|selection|placeholder|marker|backdrop|file-selector-button)(?![\w-])|::(?:part|slotted)\([^)]*\)/g
+
+function askableForm(text: string): string | null {
+  const bare = text.replace(PSEUDO_ELEMENT_RE, '').replace(STATE_PSEUDO_RE, '').trim()
+  // What's left has to still be a selector: `:hover {}` on its own strips to
+  // nothing, and `.a > :hover` to a dangling combinator.
+  if (!bare || /[>+~]\s*$/.test(bare) || bare.startsWith('>')) return null
+  return bare
+}
+
+/** The selectors worth asking the DOM about, mapped back to the rule texts
+ *  that asked for them. */
+function askableSelectors(rules: ParsedRule[]): Map<string, string[]> {
+  // One entry per distinct selector, mapped back to every text that asked for
+  // it — `.a:hover` and `.a` ask the same question of the DOM.
+  const askedFor = new Map<string, string[]>()
+  for (const rule of rules) {
+    for (const sel of rule.selectors) {
+      const ask = askableForm(sel.text)
+      if (!ask) continue
+      const list = askedFor.get(ask)
+      if (list) list.push(sel.text)
+      else askedFor.set(ask, [sel.text])
+    }
+  }
+  return askedFor
+}
+
+/** What the page said about one element: what it renders as, and which of the
+ *  asked-for selectors target it. */
+export type CanvasIdentity = {
+  tag: string
+  id?: string | null
+  classes: string[]
+  attributes: Record<string, string>
+}
+export type CanvasAsk = {
+  answer: { identity: CanvasIdentity | null; matched: Record<string, boolean | null> } | null
+  askedFor: Map<string, string[]>
+}
+
+/**
+ * Ask the page everything the panel needs about the selected element, in ONE
+ * round trip. Identity and selector matching used to be asked separately —
+ * two questions about the same element at the same moment, each bounded by
+ * its own 1.5s timeout, and the second couldn't start until the first came
+ * back. The chips stayed blank for the sum of the two.
+ *
+ * Returns null when there's nothing to ask (no path for the node, or no
+ * canvas), which callers pass straight through so they don't ask again.
+ */
+export async function askCanvasAbout(rootKey: string, rules: ParsedRule[]): Promise<CanvasAsk | null> {
+  const path = getHost().pathOf?.(rootKey)
+  if (!path || !hasCanvas()) return null
+  const askedFor = askableSelectors(rules)
+  const answer = await queryCanvas(path, [...askedFor.keys()])
+  return { answer, askedFor }
+}
+
+/**
+ * Fill `target.domMatched` from what the canvas said about these selectors.
+ *
+ * This is the whole point of the exercise: the rendered DOM knows what every
+ * component renders, what every loop produced, and what classes a script or a
+ * `class:list` expression put there — none of which the source tree can see.
+ * Selectors the engine can't be asked about (or a canvas that doesn't answer)
+ * are simply left out of the map, so they fall back to the source matcher.
+ *
+ * Pass `asked` (including null) to reuse an answer already in hand; omit it and
+ * this asks on its own.
+ */
+export async function primeDomMatches(
+  target: MatchTarget,
+  rules: ParsedRule[],
+  asked?: CanvasAsk | null,
+): Promise<void> {
+  const ask = asked !== undefined ? asked : await askCanvasAbout(target.rootKey, rules)
+  if (!ask?.answer) return
+  const matched = new Map<string, boolean>()
+  for (const [text, hit] of matchedTexts(ask)) matched.set(text, hit)
+  target.domMatched = matched
+}
+
+function* matchedTexts(ask: CanvasAsk): Generator<[string, boolean]> {
+  for (const [sel, texts] of ask.askedFor) {
+    const hit = ask.answer?.matched[sel]
+    if (typeof hit !== 'boolean') continue // the engine refused it — fall back
+    for (const text of texts) yield [text, hit]
+  }
+}
+
 // ───────────────────────────── Match target ─────────────────────────────
 
 export async function resolveTarget(
   selected: AnyEl,
   scan: EmbedScan,
+  /** An answer already in hand (see askCanvasAbout) — including null, which
+   *  means "there was nothing to ask". Omit it and this asks the page itself. */
+  asked?: CanvasAsk | null,
 ): Promise<{ target: MatchTarget; rootSnapshot: ElementSnapshot }> {
   const rootKey = serializeElementId(selected)
   const snapshots = new Map<string, ElementSnapshot | null>()
@@ -411,7 +674,40 @@ export async function resolveTarget(
       return snap
     },
   }
-  return { target: { rootKey, view }, rootSnapshot: await buildSnapshot(selected) }
+  const target: MatchTarget = { rootKey, view }
+  let rootSnapshot = await buildSnapshot(selected)
+  // What the selected node actually renders as. A component instance has no
+  // tag or classes of its own — `<Section>` says nothing about the
+  // `<section class="section">` it produces — so the header, the chips, and
+  // every selector composed from them were describing the call site rather
+  // than the element on the page. The canvas knows the difference.
+  let identity: CanvasIdentity | null | undefined = asked?.answer?.identity
+  if (asked === undefined) {
+    const path = getHost().pathOf?.(rootKey)
+    if (path && hasCanvas()) identity = (await queryCanvas(path, []))?.identity
+  }
+  if (identity) {
+    const attributes = { ...identity.attributes }
+    delete attributes.class
+    if (identity.classes.length) attributes.class = identity.classes.join(' ')
+    rootSnapshot = {
+      ...rootSnapshot,
+      tag: identity.tag,
+      id: identity.id ?? rootSnapshot.id,
+      classes: identity.classes,
+      classList: identity.classes,
+      attributes,
+    }
+  }
+  // What the header shows is also what the MATCHER should match against. The
+  // view builds its snapshots from the source tree, where a component instance
+  // or a layout has no tag of its own — and the matcher rejects a type selector
+  // (and `:root`) it cannot verify. So `html { … }` and `:root { … }` silently
+  // failed to target the very element the panel was calling `html.theme-dark`,
+  // while the class and attribute selectors beside them matched. Seed the cache
+  // with the resolved snapshot so the selected element is matched as rendered.
+  snapshots.set(rootKey, rootSnapshot)
+  return { target, rootSnapshot }
 }
 
 // ───────────────────────────── Breakpoints ─────────────────────────────
@@ -558,12 +854,46 @@ async function readAllProjectCss(): Promise<Array<{ label: string; css: string }
       files = []
     }
   }
-  for (const f of files) {
+  // All at once. These were read one after another, which on a project with a
+  // dozen stylesheets is a dozen round trips end to end — and this runs while the
+  // panel is doing its own cold scan, so the two were queueing behind each other.
+  // Promise.all keeps the order, so the cascade still reads as it does on disk.
+  const read = await Promise.all(
+    files.map(async (f) => {
+      try {
+        const res = await window.avb.readStyleFile(f.path)
+        return { label: f.rel, css: res?.css ?? '' }
+      } catch {
+        return null // unreadable — skip it rather than fail the whole scan
+      }
+    }),
+  )
+  for (const entry of read) if (entry) out.push(entry)
+  // Variables are just as often declared in a component's global block as in a
+  // stylesheet, so the picker has to read those too.
+  let astro = host.astroFiles
+  if (!astro.length && host.projectPath) {
     try {
-      const res = await window.avb.readStyleFile(f.path)
-      out.push({ label: f.rel, css: res?.css ?? '' })
+      const res = await window.avb.listAstroStyleFiles(host.projectPath)
+      astro = res?.files || []
     } catch {
-      /* unreadable — skip it rather than fail the whole scan */
+      astro = []
+    }
+  }
+  const readAstro = await Promise.all(
+    astro.map(async (f) => {
+      try {
+        const res = await window.avb.readStyleFile(f.path)
+        return { name: f.name, css: res?.css ?? '' }
+      } catch {
+        return null // unreadable — skip it rather than fail the whole scan
+      }
+    }),
+  )
+  for (const entry of readAstro) {
+    if (!entry) continue
+    for (const region of splitEmbed(entry.css).regions) {
+      if (isGlobalRegion(region)) out.push({ label: entry.name, css: region.css })
     }
   }
   walkNodes(host.nodes, (n) => {

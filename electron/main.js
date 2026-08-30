@@ -1,6 +1,7 @@
 const {
   app,
   BrowserWindow,
+  screen,
   ipcMain,
   dialog,
   shell,
@@ -8,16 +9,18 @@ const {
   protocol,
   net: enet,
   nativeImage,
+  clipboard,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
 const net = require('net');
 const crypto = require('crypto');
-const { spawn, execFile, execFileSync } = require('child_process');
+const { spawn, spawnSync, execFile, execFileSync } = require('child_process');
 
 const {
   parsePage,
+  locateSelection,
   serializePage,
   parseTemplate,
   serializeNodes,
@@ -25,13 +28,71 @@ const {
   parsePropSchema,
   parseExtendsTag,
   parseSlots,
+  defaultSlotInline,
+  rootTag,
 } = require('./astroParser');
+const { parseMarkdownPage, serializeMarkdownPage } = require('./markdownParser');
 const { scaffoldProject } = require('./scaffold');
-const { importersOf } = require('./cmsRefs');
+const {
+  findCollections,
+  replaceCollection,
+  readGeneral,
+  writeGeneral,
+  GENERAL,
+} = require('./jsCollections');
+const { aliasMap, importersOf, resolveImport } = require('./cmsRefs');
+const { readContentConfig, validateEntry, stopAllServices } = require('./contentConfig');
+const thumbs = require('./thumbs');
+const cssVars = require('./cssVars');
+const { readInjectedRoutes } = require('./injectedRoutes.js');
+const { createStarter } = require('./starter');
+const { openingBounds } = require('./windowBounds');
+const { componentFile } = require('./componentFile');
+const { componentUsage, instancesIn } = require('./componentUsage');
+const { listEntries, writeEntry, countEntries, coveredPaths } = require('./contentEntries');
+const { planRename, applyRename } = require('./contentRefs');
+const { mergeBranch, deleteBranch, switchBranch, resolveMerge } = require('./gitBranches');
+const { probeUrl } = require('./devProbe');
+const gitHistory = require('./gitHistory');
+const gitSnapshot = require('./gitSnapshot');
+const previewWorktree = require('./previewWorktree');
+const { registerTerminalHandlers, cleanupTerminals } = require('./terminal');
 const { autoUpdater } = require('electron-updater');
 
 let mainWindow = null;
 let devServer = null; // {proc, url, projectPath}
+
+// --- Dev reload ------------------------------------------------------------
+// Only the renderer hot-reloads on its own (Vite). preload.js is re-read from
+// disk on a window reload, but main.js and astroParser.js are bound into this
+// process at require time and can only be picked up by starting over — which
+// is what "Reload All Code" does. So the app relaunches itself, leaving the
+// open project in a file for the next process to pick up (the supervisor
+// re-spawns us with the same argv, so there's nothing to hand forward there),
+// landing back where you were instead of on the welcome screen.
+const isDev = !!process.env.VITE_DEV_SERVER_URL;
+// Exiting with this asks scripts/dev-electron.mjs to start us again. Not
+// app.relaunch(): `npm run dev` runs us under `concurrently -k`, so quitting
+// would take the Vite server down with us and the new process would load a
+// dead localhost:5173.
+const RELAUNCH_CODE = 42;
+const reopenFile = () => path.join(app.getPath('userData'), 'dev-reopen.json');
+
+function relaunchApp() {
+  try {
+    // openProjectRoot is set whenever a project's watcher starts, i.e. on open.
+    if (openProjectRoot) {
+      fs.writeFileSync(reopenFile(), JSON.stringify({ path: openProjectRoot }), 'utf8');
+    }
+  } catch {
+    /* worst case the reload lands on the welcome screen */
+  }
+  // app.exit skips before-quit, so take the Astro dev server down by hand —
+  // otherwise it keeps the port and the next process adopts a server still
+  // running the previously generated config.
+  stopDevServer();
+  app.exit(RELAUNCH_CODE);
+}
 
 const isWin = process.platform === 'win32';
 
@@ -106,11 +167,20 @@ function setApplicationIcon() {
 }
 
 function createWindow() {
+  // Opened filled: the display the pointer is on, minus what the OS keeps (see
+  // windowBounds.js). The display under the pointer rather than the primary
+  // one — on a laptop with a monitor beside it, the app should open where the
+  // person is looking.
+  let bounds;
+  try {
+    bounds = openingBounds(screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea);
+  } catch {
+    // No display to ask about (a headless run, an unusual session): a laptop
+    // sized window is a fine thing to fall back to.
+    bounds = openingBounds({ width: 1480, height: 940 });
+  }
   mainWindow = new BrowserWindow({
-    width: 1480,
-    height: 940,
-    minWidth: 1024,
-    minHeight: 640,
+    ...bounds,
     title: 'Stacki',
     backgroundColor: '#111111',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
@@ -137,6 +207,14 @@ function createWindow() {
     shell.openExternal(url);
     return { action: 'deny' };
   });
+
+  // Somebody closed the window. Whatever was open is over: the next window is a
+  // fresh start and belongs on the welcome screen, not back in the project this
+  // one had. (A reload doesn't come through here, which is the difference the
+  // reopen above is asking about.)
+  mainWindow.on('closed', () => {
+    openProjectRoot = null;
+  });
 }
 
 // Custom menu: on macOS the native menu consumes ⌘Z/⌘C/⌘V before the page
@@ -146,7 +224,46 @@ function buildMenu() {
   const isMac = process.platform === 'darwin';
   const template = [
     ...(isMac ? [{ role: 'appMenu' }] : []),
-    { role: 'fileMenu' },
+    {
+      // Spelled out rather than `role: 'fileMenu'`, which takes no additions.
+      // What that role provides is one item — Close Window on macOS, Quit
+      // everywhere else — so the menu keeps exactly what it had, with the
+      // update check above it.
+      label: 'File',
+      submenu: [
+        {
+          label: 'Interface Sounds',
+          type: 'checkbox',
+          checked: !!settings.sound,
+          // The menu owns the setting: it is the only place it can be changed,
+          // so the tick is the state rather than a copy of it.
+          click: (item) => {
+            settings = { ...settings, sound: item.checked };
+            writeSettings();
+            send('menu:sound', item.checked);
+          },
+        },
+        { type: 'separator' },
+        // Until now the only way out of a project was to close the app, and on
+        // macOS closing the app is not what people think it is: the window goes
+        // and the process stays, so coming back lands on the same project and
+        // there is nothing to press that says otherwise.
+        {
+          label: 'Open Project…',
+          accelerator: 'CmdOrCtrl+O',
+          click: () => send('menu:openProject'),
+        },
+        {
+          label: 'Close Project',
+          accelerator: 'Shift+CmdOrCtrl+W',
+          click: () => send('menu:closeProject'),
+        },
+        { type: 'separator' },
+        { label: 'Check for Updates…', click: () => void checkForUpdatesFromMenu() },
+        { type: 'separator' },
+        isMac ? { role: 'close' } : { role: 'quit' },
+      ],
+    },
     {
       label: 'Edit',
       submenu: [
@@ -158,14 +275,86 @@ function buildMenu() {
         { label: 'Paste', accelerator: 'CmdOrCtrl+V', click: () => send('menu:paste') },
         { role: 'selectAll' },
         { type: 'separator' },
+        {
+          label: 'Copy Selection',
+          accelerator: 'Shift+CmdOrCtrl+C',
+          click: () => send('menu:copySelection'),
+        },
         { label: 'Insert Element…', accelerator: 'CmdOrCtrl+E', click: () => send('menu:insert') },
       ],
     },
-    { role: 'viewMenu' },
+    // In dev ⌘R has to mean "restart the process". main.js, astroParser.js and
+    // the rest of this side are bound in at require time, so the stock reload
+    // repaints the renderer while silently going on running the old code —
+    // the failure mode is an edit that appears to do nothing. The plain window
+    // reload keeps its usual behaviour one item down. A packaged build has no
+    // supervisor to restart it and no source to pick up, so it keeps the stock
+    // menu.
+    isDev
+      ? {
+          label: 'View',
+          submenu: [
+            { label: 'Reload All Code', accelerator: 'CmdOrCtrl+R', click: () => relaunchApp() },
+            {
+              label: 'Reload Window Only',
+              accelerator: 'Shift+CmdOrCtrl+R',
+              click: () => mainWindow?.webContents.reload(),
+            },
+            { type: 'separator' },
+            { role: 'toggleDevTools' },
+            { type: 'separator' },
+            { role: 'resetZoom' },
+            { role: 'zoomIn' },
+            { role: 'zoomOut' },
+            { type: 'separator' },
+            { role: 'togglefullscreen' },
+          ],
+        }
+      : { role: 'viewMenu' },
     { role: 'windowMenu' },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
+
+// A project the app has been asked to open in the window it is about to load —
+// set by `project:close` when somebody picks a different project, since letting
+// go of one is done by reloading the window and the choice has to outlive that.
+// Consumed on read.
+let pendingProject = null;
+
+// The project the renderer should pick up as it mounts, or null — which is the
+// welcome screen, and is what a cold start gets.
+//
+// Three ways a renderer can come up wanting a project:
+//   - it was told to: somebody chose one from the menu, and the window was
+//     reloaded to let go of the last one (`pendingProject`).
+//   - it reloaded but this process didn't — a Vite full page reload, or
+//     "Reload Window Only" in dev. openProjectRoot is still in memory, so use
+//     it. A window that a PERSON closed clears that memory (see createWindow),
+//     because closing a window is not reloading it: the next one is a fresh
+//     start and must land on the welcome screen.
+//   - the whole process restarted ("Reload All Code"), and memory is gone —
+//     relaunchApp left the path in a file. Consumed on read, so a later cold
+//     start doesn't silently skip the welcome screen.
+ipcMain.handle('project:pending', () => {
+  const asked = pendingProject;
+  pendingProject = null;
+  if (asked && fs.existsSync(asked)) return asked;
+  if (!isDev) return null;
+  if (openProjectRoot && fs.existsSync(openProjectRoot)) return openProjectRoot;
+  let p = null;
+  try {
+    p = JSON.parse(fs.readFileSync(reopenFile(), 'utf8'))?.path || null;
+  } catch {
+    return null;
+  }
+  try {
+    fs.rmSync(reopenFile(), { force: true });
+  } catch {
+    /* non-fatal */
+  }
+  return p && fs.existsSync(p) ? p : null;
+});
 
 // Native clipboard actions on the focused element, requested by the renderer
 // when a menu Copy/Paste lands while a text field has focus.
@@ -177,24 +366,82 @@ ipcMain.handle('native:paste', () => {
   mainWindow?.webContents.paste();
   return { ok: true };
 });
+// Undo INSIDE a field. ⌘Z is a menu accelerator, so the key never reaches the
+// page and a text field's own undo never runs — this is the app handing it
+// back when that is what the shortcut meant.
+ipcMain.handle('native:undo', () => {
+  mainWindow?.webContents.undo();
+  return { ok: true };
+});
+ipcMain.handle('native:redo', () => {
+  mainWindow?.webContents.redo();
+  return { ok: true };
+});
 
 app.whenReady().then(() => {
+  // Before the menu, which draws the sound item's tick from it.
+  settings = readSettings();
   setApplicationIcon();
   registerAssetProtocol();
   buildMenu();
   createWindow();
   startAutoUpdateChecks();
+  // Terminals open in the project the app has open — same reach as the asset
+  // protocol, which is what `openProjectRoot` already scopes.
+  registerTerminalHandlers({ send, projectRoot: () => openProjectRoot });
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 
-app.on('window-all-closed', () => {
+// Everything a project had running, let go of. The window reloads after this,
+// which is the only way to be sure nothing of the last project is still being
+// held — a page half-loaded, an undo stack, a watcher, a shell — and none of
+// this survives the reload on its own: a pty outlives the window that opened
+// it, and the dev server outlives everything.
+ipcMain.handle('project:close', async (_e, next) => {
+  pendingProject = typeof next === 'string' && next ? next : null;
   stopDevServer();
+  stopAllServices();
+  stopAllPreviews();
+  cleanupTerminals();
+  if (watcher) {
+    watcher.close();
+    watcher = null;
+  }
+  // Nothing is open, so nothing is in reach: the asset protocol and the
+  // terminals both scope themselves to this.
+  openProjectRoot = null;
+  // The window starts over. Done here rather than in the renderer because it
+  // is the same act as the teardown above — the renderer holds a page, an undo
+  // stack and forty pieces of state that belong to the project just closed, and
+  // none of it should be in the window that opens the next one.
+  mainWindow?.webContents.reload();
+  return { ok: true };
+});
+
+app.on('window-all-closed', () => {
+  // The hidden window a thumbnail is captured in is still a window, and
+  // destroying it fires this. That is not the app being closed — and treating
+  // it as one killed the dev server (and, off macOS, quit) in the middle of
+  // taking a picture.
+  if (mainWindow && !mainWindow.isDestroyed()) return;
+  stopDevServer();
+  // The pty ids are keyed to the window that opened them, so a surviving shell
+  // could never be reached again — and on macOS the app stays running.
+  cleanupTerminals();
   if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('before-quit', () => stopDevServer());
+// Reading a project's content config leaves a process behind holding its
+// schemas; they go when the app does.
+app.on('before-quit', () => stopAllServices());
+// The preview checkouts live inside the user's projects, so leaving one behind
+// leaves a stray folder in a place they will notice.
+app.on('before-quit', () => stopAllPreviews());
+// A pty outlives the window that opened it unless it is killed.
+app.on('before-quit', () => cleanupTerminals());
 
 // ---------------------------------------------------------------------------
 // Auto update
@@ -208,6 +455,9 @@ const AUTO_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 let autoUpdateInterval = null;
 let autoUpdateCheckInFlight = false;
 let autoUpdateErrorDialogShown = false;
+// A check somebody asked for, rather than the scheduled one. It answers in a
+// dialog either way, so the error handler below leaves the talking to it.
+let manualUpdateCheck = false;
 
 // Update-check failures the user can do nothing about, and so should never
 // see a dialog for: they're offline, or a release is mid-publish and its
@@ -318,6 +568,10 @@ function registerAutoUpdaterEvents() {
   autoUpdater.on('error', (error) => {
     logAutoUpdate('Auto update error', formatAutoUpdateError(error));
 
+    // A check from the File menu reports its own failure, and reports it even
+    // when this dialog has already been shown once — two dialogs for the one
+    // click would be worse than none.
+    if (manualUpdateCheck) return;
     if (autoUpdateErrorDialogShown || isExpectedAutoUpdateNetworkError(error)) return;
     autoUpdateErrorDialogShown = true;
 
@@ -345,6 +599,74 @@ async function runAutoUpdateCheck() {
     }
   } finally {
     autoUpdateCheckInFlight = false;
+  }
+}
+
+// The File menu's own check. The scheduled one is deliberately silent — it
+// logs, and speaks up only when there is something to install — but somebody
+// who asks is owed an answer either way, "you already have the latest"
+// included. Otherwise the menu item looks broken every time it works.
+async function checkForUpdatesFromMenu() {
+  const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+
+  // Nothing to check against: electron-updater reads the feed the installer
+  // was built with, and a dev run has no installer. Saying so beats a check
+  // that silently does nothing.
+  if (!app.isPackaged) {
+    await dialog.showMessageBox(parent, {
+      type: 'info',
+      title: 'Check for Updates',
+      message: 'Updates are only checked in the installed app.',
+      detail: `This is a development build (${app.getVersion()}), which updates when you rebuild it.`,
+    });
+    return;
+  }
+
+  if (autoUpdateCheckInFlight) {
+    await dialog.showMessageBox(parent, {
+      type: 'info',
+      title: 'Check for Updates',
+      message: 'Already checking for updates.',
+    });
+    return;
+  }
+
+  autoUpdateCheckInFlight = true;
+  manualUpdateCheck = true;
+  try {
+    const result = await autoUpdater.checkForUpdates();
+    // `downloadPromise` is the difference between "there is a newer version"
+    // and "there is a version": the feed always names one, and downloading is
+    // what electron-updater does only when it is actually newer.
+    if (result?.downloadPromise) {
+      logAutoUpdate('Manual check found an update', { version: result.updateInfo?.version });
+      await dialog.showMessageBox(parent, {
+        type: 'info',
+        title: 'Update Available',
+        message: `Stacki ${result.updateInfo?.version} is downloading.`,
+        detail: 'You’ll be asked whether to restart once it has finished.',
+      });
+      return;
+    }
+    logAutoUpdate('Manual check found no update', { version: app.getVersion() });
+    await dialog.showMessageBox(parent, {
+      type: 'info',
+      title: 'Check for Updates',
+      message: `Stacki ${app.getVersion()} is the latest version.`,
+    });
+  } catch (error) {
+    logAutoUpdate('Manual check failed', formatAutoUpdateError(error));
+    await dialog.showMessageBox(parent, {
+      type: 'warning',
+      title: 'Check for Updates',
+      // The raw error carries response headers and a stack; the log has all of
+      // it, the dialog gets the first line.
+      message: 'Stacki could not check for updates.',
+      detail: formatAutoUpdateError(error).split('\n')[0].slice(0, 200),
+    });
+  } finally {
+    autoUpdateCheckInFlight = false;
+    manualUpdateCheck = false;
   }
 }
 
@@ -580,6 +902,13 @@ function findFreePort(start) {
   });
 }
 
+// The page formats Astro routes from a file: .astro, plus markdown when the
+// project has the integration for it (.md always, .mdx via @astrojs/mdx).
+// Kept as one place so discovery, routing and reading can't drift apart.
+const PAGE_MD_RE = /\.mdx?$/i;
+const isMarkdownPage = (p) => PAGE_MD_RE.test(p);
+const isMdx = (p) => /\.mdx$/i.test(p);
+
 function listAstroFiles(dir) {
   if (!fs.existsSync(dir)) return [];
   const out = [];
@@ -587,7 +916,9 @@ function listAstroFiles(dir) {
     for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
       const full = path.join(d, entry.name);
       if (entry.isDirectory()) walk(full);
-      else if (entry.name.endsWith('.astro') || (d.includes(`${path.sep}pages`) && entry.name.endsWith('.md'))) {
+      // Markdown only counts as a page. A .md under src/components isn't a
+      // component, it's a README.
+      else if (entry.name.endsWith('.astro') || (d.includes(`${path.sep}pages`) && PAGE_MD_RE.test(entry.name))) {
         out.push(full);
       }
     }
@@ -602,10 +933,67 @@ function toPosix(p) {
 
 function routeForPage(projectPath, pagePath) {
   const pagesDir = path.join(projectPath, 'src', 'pages');
-  let rel = toPosix(path.relative(pagesDir, pagePath)).replace(/\.(astro|md)$/, '');
+  let rel = toPosix(path.relative(pagesDir, pagePath)).replace(/\.(astro|mdx?)$/i, '');
   if (rel === 'index') return '/';
   if (rel.endsWith('/index')) rel = rel.slice(0, -'/index'.length);
   return '/' + rel;
+}
+
+// Astro's dev server enforces the project's `trailingSlash`. Under 'always' a
+// slashless URL is answered with a 404 and Astro's own "Do you want to go to
+// /de/hotel/ instead?" page; under 'never' the slash is the 404. The canvas
+// points at real URLs, so it has to know which spelling this project serves.
+const TRAILING_SLASH_MODES = ['always', 'never', 'ignore'];
+const ASTRO_CONFIG_FILES = [
+  'astro.config.mjs',
+  'astro.config.js',
+  'astro.config.mts',
+  'astro.config.ts',
+  'astro.config.cjs',
+];
+
+// Read from the config's text, not by importing it: the file is ESM, is often
+// TypeScript, and is written to be loaded by Astro rather than by this
+// process. Whole-line comments go first so a commented-out setting doesn't
+// count; a trailing `//` is left alone because it can't be told from the one
+// in a URL without really parsing.
+function trailingSlashFromSource(text) {
+  const code = text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
+  const m = code.match(/(^|[\s,{])trailingSlash\s*:\s*['"`](always|never|ignore)['"`]/);
+  return m ? m[2] : null;
+}
+
+function readTrailingSlash(projectPath) {
+  // What the dev server resolved beats what the config says: it has been
+  // through Astro's own defaults, and it accounts for a value that arrives by
+  // variable, spread or integration rather than as a literal. Only this app's
+  // own server writes it, so it is only trustworthy while that server is the
+  // one running — an adopted external server never loads the marker config,
+  // and a file left behind by an earlier run would answer for a config that
+  // has since changed.
+  const ours =
+    devServer && devServer.projectPath === projectPath && !devServer.external;
+  try {
+    if (!ours) throw new Error('no server of ours');
+    const resolved = JSON.parse(
+      fs.readFileSync(path.join(projectPath, 'node_modules', '.avb', 'resolved.json'), 'utf8')
+    );
+    if (TRAILING_SLASH_MODES.includes(resolved.trailingSlash)) return resolved.trailingSlash;
+  } catch {
+    /* no server has run yet — read the config instead */
+  }
+  for (const file of ASTRO_CONFIG_FILES) {
+    let text;
+    try {
+      text = fs.readFileSync(path.join(projectPath, file), 'utf8');
+    } catch {
+      continue;
+    }
+    const mode = trailingSlashFromSource(text);
+    if (mode) return mode;
+    break; // the first config that exists is the one Astro loads
+  }
+  return 'ignore'; // Astro's default, and the one that serves either spelling
 }
 
 function isAstroProject(dir) {
@@ -625,11 +1013,44 @@ function isAstroProject(dir) {
 }
 
 // ---------------------------------------------------------------------------
+// Settings
+//
+// One file, read once at startup and written on every change. Only the app's
+// own preferences live here — anything about a project belongs to the project.
+// ---------------------------------------------------------------------------
+
+// Sound is off. An editor that makes a noise the first time somebody touches it
+// is an editor they turn off, so it is asked for rather than opted out of.
+const SETTINGS_DEFAULTS = { sound: false };
+let settings = { ...SETTINGS_DEFAULTS };
+
+const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
+
+function readSettings() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
+    return saved && typeof saved === 'object' ? { ...SETTINGS_DEFAULTS, ...saved } : { ...SETTINGS_DEFAULTS };
+  } catch {
+    return { ...SETTINGS_DEFAULTS };
+  }
+}
+
+function writeSettings() {
+  try {
+    fs.writeFileSync(settingsFile(), JSON.stringify(settings, null, 2), 'utf8');
+  } catch {
+    /* non-fatal — the setting still holds for this run */
+  }
+}
+
+// The renderer asks once on load; the menu pushes every change after that.
+ipcMain.handle('settings:get', () => settings);
+
+// ---------------------------------------------------------------------------
 // Recent projects + preview thumbnails
 // ---------------------------------------------------------------------------
 
 const recentsFile = () => path.join(app.getPath('userData'), 'recents.json');
-const thumbsDir = () => path.join(app.getPath('userData'), 'thumbs');
 
 function readRecents() {
   try {
@@ -648,11 +1069,6 @@ function writeRecents(list) {
   }
 }
 
-function thumbPathFor(projectPath) {
-  const hash = crypto.createHash('sha1').update(projectPath).digest('hex').slice(0, 16);
-  return path.join(thumbsDir(), `${hash}.png`);
-}
-
 ipcMain.handle('recents:list', async () => {
   // Drop entries whose folder is gone or no longer looks like an Astro project.
   const list = readRecents().filter((r) => {
@@ -662,19 +1078,30 @@ ipcMain.handle('recents:list', async () => {
       return false;
     }
   });
+  const userData = app.getPath('userData');
   return list.map((r) => {
+    // `stale` compares the picture against the files it was taken from, so a
+    // project edited in another editor — or by a teammate, through git — says
+    // so on the card instead of showing last month's homepage as if it were
+    // today's.
+    let stale = true;
     let thumb = null;
     try {
-      const tp = thumbPathFor(r.path);
-      if (fs.existsSync(tp)) {
-        thumb = 'data:image/png;base64,' + fs.readFileSync(tp).toString('base64');
-      }
+      thumb = thumbs.readThumb(userData, r.path);
+      stale = thumbs.isStale(userData, r.path);
     } catch {
       /* card renders a placeholder */
     }
-    return { ...r, thumb };
+    return { ...r, thumb, stale: !!stale, canRefresh: hasDependencies(r.path) };
   });
 });
+
+// Astro has to be installed for a page to be rendered at all; without it the
+// card can only offer to open the project.
+function hasDependencies(projectPath) {
+  const binName = isWin ? 'astro.cmd' : 'astro';
+  return fs.existsSync(path.join(projectPath, 'node_modules', '.bin', binName));
+}
 
 ipcMain.handle('recents:add', async (_e, projectPath) => {
   const list = readRecents().filter((r) => r.path !== projectPath);
@@ -689,33 +1116,148 @@ ipcMain.handle('recents:add', async (_e, projectPath) => {
 
 ipcMain.handle('recents:remove', async (_e, projectPath) => {
   writeRecents(readRecents().filter((r) => r.path !== projectPath));
-  try {
-    fs.rmSync(thumbPathFor(projectPath), { force: true });
-  } catch {
-    /* non-fatal */
-  }
+  // The picture and the note about when it was taken both go.
+  thumbs.forget(app.getPath('userData'), projectPath);
   return { ok: true };
 });
 
-// Captures the given window region (the preview iframe's rect, in DIP
-// coordinates) and stores it as the project's thumbnail.
-ipcMain.handle('recents:captureThumb', async (_e, { projectPath, rect }) => {
-  if (!mainWindow || mainWindow.isDestroyed()) return { ok: false };
+// The project's home page, rendered on its own and photographed from the top.
+//
+// Two ways in. The project that is open already has a dev server, so its
+// picture costs one hidden window. A project on the start screen has nothing
+// running, so one is started for it, used, and stopped again — which is what
+// makes "the site as it is now" true for a project that was last edited
+// somewhere else entirely.
+let capturing = null; // one at a time: each capture is a browser and a server
+// Bumped when a project is opened. A capture waiting its turn behind another
+// one belongs to a start screen that is no longer on screen — and the machine
+// is now busy starting the project the user actually asked for.
+let captureEra = 0;
+
+async function captureThumb(projectPath) {
+  const era = captureEra;
+  if (capturing) await capturing.catch(() => {});
+  if (era !== captureEra) return { ok: false, error: 'skipped' };
+  capturing = doCaptureThumb(projectPath);
   try {
-    const image = await mainWindow.webContents.capturePage({
-      x: Math.max(0, Math.round(rect.x)),
-      y: Math.max(0, Math.round(rect.y)),
-      width: Math.max(1, Math.round(rect.width)),
-      height: Math.max(1, Math.round(rect.height)),
-    });
-    if (image.isEmpty()) return { ok: false };
-    fs.mkdirSync(thumbsDir(), { recursive: true });
-    fs.writeFileSync(thumbPathFor(projectPath), image.resize({ width: 640 }).toPNG());
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: err.message };
+    return await capturing;
+  } finally {
+    capturing = null;
   }
+}
+
+async function doCaptureThumb(projectPath) {
+  const userData = app.getPath('userData');
+  // Already running for this project (it is the one that is open) — use it.
+  if (devServer && devServer.projectPath === projectPath && devServer.url) {
+    if (await serverAlive(devServer.url)) {
+      return thumbs.capture(userData, projectPath, devServer.url + '/');
+    }
+  }
+  if (!hasDependencies(projectPath)) {
+    return { ok: false, error: 'This project has no dependencies installed yet.' };
+  }
+  return withTemporaryServer(projectPath, (url) => thumbs.capture(userData, projectPath, url + '/'));
+}
+
+// A dev server for a project that is not open, kept apart from the app's own:
+// `devServer` belongs to the canvas, and a thumbnail must not disturb what the
+// editor is showing. The project's own config is used rather than the app's
+// generated one — the picture is of the site, not of the canvas.
+async function withTemporaryServer(projectPath, fn) {
+  const binName = isWin ? 'astro.cmd' : 'astro';
+  const localBin = path.join(projectPath, 'node_modules', '.bin', binName);
+  const port = await findFreePort(4400 + Math.floor(Math.random() * 200));
+  const [cmd, argv] = nodeCliCommand(localBin, [
+    'dev',
+    '--port',
+    String(port),
+    '--host',
+    '127.0.0.1',
+  ]);
+  const proc = spawn(cmd, argv, {
+    cwd: projectPath,
+    shell: isWin && cmd === localBin,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+  });
+  let log = '';
+  proc.stdout.on('data', (d) => (log = (log + d).slice(-4000)));
+  proc.stderr.on('data', (d) => (log = (log + d).slice(-4000)));
+
+  const url = `http://127.0.0.1:${port}`;
+  const stop = () => {
+    // Astro >= 7 forks the real server and the CLI exits, so killing what was
+    // spawned is not enough — the CLI is asked to stop it, and the process
+    // group is killed for the versions that do not fork.
+    try {
+      const [stopCmd, stopArgv] = nodeCliCommand(localBin, ['dev', 'stop']);
+      execFile(stopCmd, stopArgv, { cwd: projectPath, timeout: 10000 }, () => {});
+    } catch {
+      /* best effort */
+    }
+    try {
+      if (isWin) spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { shell: true });
+      else process.kill(-proc.pid, 'SIGTERM');
+    } catch {
+      try {
+        proc.kill('SIGTERM');
+      } catch {
+        /* already gone */
+      }
+    }
+  };
+
+  try {
+    const deadline = Date.now() + 45000;
+    let up = false;
+    while (Date.now() < deadline) {
+      if (await serverAlive(url)) {
+        up = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    if (!up) {
+      return { ok: false, error: cleanDevLog(log) || 'the dev server did not start in time' };
+    }
+    return await fn(url);
+  } finally {
+    stop();
+  }
+}
+
+const cleanDevLog = (text) =>
+  String(text || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !/^\[?\d{1,2}:\d{2}/.test(l))
+    .slice(-2)
+    .join(' ')
+    .slice(0, 300);
+
+// Asked for by the start screen, for a card whose picture is out of date.
+ipcMain.handle('recents:refreshThumb', async (_e, projectPath) => {
+  const result = await captureThumb(projectPath);
+  const userData = app.getPath('userData');
+  return { ...result, thumb: thumbs.readThumb(userData, projectPath), stale: thumbs.isStale(userData, projectPath) };
 });
+
+// While a project is open, its picture is kept current in the background: once
+// when the preview comes up, and again a while after the last edit. Neither
+// touches the window the user is working in.
+let thumbTimer = null;
+function scheduleThumb(projectPath, delay) {
+  clearTimeout(thumbTimer);
+  thumbTimer = setTimeout(() => {
+    if (!devServer || devServer.projectPath !== projectPath) return;
+    if (!thumbs.isStale(app.getPath('userData'), projectPath)) return;
+    captureThumb(projectPath).then((r) => {
+      if (r?.ok) send('recents:thumb', { projectPath });
+    });
+  }, delay);
+  if (thumbTimer.unref) thumbTimer.unref();
+}
 
 // ---------------------------------------------------------------------------
 // Project IPC
@@ -853,6 +1395,34 @@ ipcMain.handle('project:createAstro', async (_e, opts) => {
   });
 });
 
+// A folder to put a new project IN, rather than the project's own folder: the
+// starter arrives as a directory of its own, named by the user.
+ipcMain.handle('project:parentDialog', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Choose where the site should go',
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  if (result.canceled || !result.filePaths.length) return { canceled: true };
+  return { canceled: false, parentPath: result.filePaths[0] };
+});
+
+// Starting from a starter. The scaffolder, the first commit and the package's
+// name are in ./starter.js; what is here is the install that follows and the
+// log the wizard reads.
+ipcMain.handle('project:createStarter', async (_e, { starter = 'lumos', parentPath, name }) => {
+  ensureToolPath(); // npm and git are both on the PATH the Dock does not have
+  const result = await createStarter({
+    starter,
+    parentPath,
+    name,
+    onLog: (text) => send('create:log', text),
+  });
+  send('create:log', '\n> installing dependencies\n');
+  await installDependencies(result.projectPath);
+  send('progress', { message: null });
+  return result;
+});
+
 ipcMain.handle('project:scaffold', async (_e, { dir, name }) => {
   scaffoldProject(dir, name);
   await installDependencies(dir);
@@ -918,21 +1488,33 @@ ipcMain.handle('project:scan', async (_e, projectPath) => {
 
   // Instance counts: how often each component is used across every .astro
   // file in src (pages, layouts, and other components).
-  const allSources = listAstroFiles(src).map((f) => {
+  const allSources = listAstroFiles(src).map((file) => {
     try {
-      return fs.readFileSync(f, 'utf8');
+      return { file, text: fs.readFileSync(file, 'utf8') };
     } catch {
-      return '';
+      return { file, text: '' };
     }
   });
   // Layouts are counted too: they show up in the palette alongside
   // components, so the instance line has to mean the same thing for both.
+  // Counted by the same function the "where is it used" list counts with —
+  // when the number and the list disagree, nothing says which one is wrong.
+  // That function counts under the name each FILE imports it as: a layout
+  // imported as `Layout` is never written `<BaseLayout>`, and counting the
+  // filename found none of them.
+  const importAliases = aliasMap(projectPath);
   for (const comp of [...components, ...layouts]) {
-    const re = new RegExp(`<${comp.name}[\\s/>]`, 'g');
-    comp.instances = allSources.reduce((n, s) => n + (s.match(re) || []).length, 0);
+    comp.instances = allSources.reduce(
+      (n, { file, text }) =>
+        n +
+        (path.resolve(file) === path.resolve(comp.path)
+          ? 0 // a file is not one of its own users
+          : instancesIn(text, { file, targetPath: comp.path, name: comp.name, aliases: importAliases })),
+      0
+    );
   }
 
-  return { pages, layouts, components, pageFolders };
+  return { pages, layouts, components, pageFolders, trailingSlash: readTrailingSlash(projectPath) };
 });
 
 // Every CSS class name used anywhere under src/ — class attributes in markup
@@ -985,21 +1567,87 @@ ipcMain.handle('project:classes', async (_e, projectPath) => {
   return [...out].sort();
 });
 
+// The declaration text for every type this file imports, so `type Props =
+// SeoProps` can be read when SeoProps lives in types.ts. One level deep and
+// only within the project — enough for the shape components actually use,
+// without turning this into a type checker.
+function importedTypes(source, filePath, projectPath) {
+  const fm = source.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!fm) return '';
+  const out = [];
+  const seen = new Set();
+  // `import type { A, B } from '…'`, `import { type A } from '…'`, and the
+  // default form — a type-only import is the common way to write this, but a
+  // plain `import { X }` of a type is legal too.
+  const re = /import\s+(?:type\s+)?(\{[^}]*\}|[\w$]+)\s*from\s*['"]([^'"]+)['"]/g;
+  let m;
+  while ((m = re.exec(fm[1])) !== null) {
+    const names = m[1]
+      .replace(/[{}]/g, '')
+      .split(',')
+      .map((n) => n.replace(/\btype\b/, '').split(/\s+as\s+/)[0].trim())
+      .filter(Boolean);
+    if (!names.length) continue;
+    const target = resolveImportPath(projectPath, filePath, m[2]);
+    if (!target || seen.has(target) || target.endsWith('.astro')) continue;
+    seen.add(target);
+    let text;
+    try {
+      text = fs.readFileSync(target, 'utf8');
+    } catch {
+      continue;
+    }
+    // Only the declarations that were actually imported, so an unrelated type
+    // in the same file can't shadow one the component declares itself.
+    for (const name of names) {
+      const decl = new RegExp(
+        `(?:^|\n)\\s*(?:export\\s+)?(?:type|interface)\\s+${name.replace(/[^\w$]/g, '')}\\b`
+      ).exec(text);
+      if (!decl) continue;
+      const from = decl.index;
+      // To the end of the declaration: an interface ends at its closing brace,
+      // a type alias at the semicolon that closes it.
+      let depth = 0;
+      let end = text.length;
+      for (let i = from; i < text.length; i++) {
+        const c = text[i];
+        if ('{(['.includes(c)) depth++;
+        else if ('})]'.includes(c)) {
+          depth--;
+          if (depth === 0 && /\{/.test(text.slice(from, i))) { end = i + 1; break; }
+        } else if (c === ';' && depth === 0 && from !== i) { end = i + 1; break; }
+      }
+      out.push(text.slice(from, end));
+    }
+  }
+  return out.join('\n');
+}
+
 function safeSchema(filePath, projectPath) {
   try {
     const source = fs.readFileSync(filePath, 'utf8');
-    const schema = parsePropSchema(source);
+    const schema = parsePropSchema(source, importedTypes(source, filePath, projectPath));
     resolveIdentifierDefaults(schema, source, filePath, projectPath);
     return {
       schema,
       extendsTag: parseExtendsTag(source),
       slots: parseSlots(source),
+      // Where that default slot sits decides whether a fresh instance
+      // arrives holding a word or empty — see defaultSlotInline.
+      slotText: defaultSlotInline(source),
+      // The HTML tag it renders as, so nesting rules apply through a
+      // component the same way they do through a plain element.
+      renderTag: rootTag(source),
       // A `...rest` spread on Astro.props means the component forwards
       // arbitrary attributes — the UI offers a free-form Attributes section.
-      hasRest: /\{[^}]*\.\.\.[\s\S]*?\}\s*=\s*Astro\.props/.test(source),
+      // Anchored to the end of the destructure rather than scanning forward
+      // from its `{`: a rest element is always last, and looking forward
+      // tripped over any `}` in front of it (`containerAttrs = {}, ...rest`).
+      // The optional `: Type` covers an annotated destructure.
+      hasRest: /\.\.\.\s*\w+\s*\}\s*(?::[^=]+)?=\s*Astro\.props/.test(source),
     };
   } catch {
-    return { schema: [], extendsTag: null, slots: [], hasRest: false };
+    return { schema: [], extendsTag: null, slots: [], slotText: false, renderTag: null, hasRest: false };
   }
 }
 
@@ -1112,8 +1760,33 @@ function resolveIdentifierDefaults(schema, source, filePath, projectPath) {
 let watcher = null;
 const selfWrites = new Map(); // absolute path -> timestamp of app-made write
 
+// A compile error replaces the site with the dev server's own error screen, and
+// that screen carries no HMR client — so when the mistake is fixed, nothing in
+// the preview hears about it and it sits on the error until someone presses
+// refresh. The app's own writes are deliberately invisible to the watcher
+// below, so this is the one place that sees every one of them: say that the
+// site may have changed, and let the renderer go and ask (see `dev:probe`).
+// `external` — the change came from outside the app: an editor, a script, a
+// git checkout. The canvas hears about the app's own writes through the dev
+// server's HMR socket and patches itself; an outside change reaches it the
+// same way, when that socket is still listening. This flag is what lets the
+// app tell the canvas directly as well, so a socket that has gone quiet is no
+// longer the difference between seeing your edit and pressing refresh.
+let pageChangeTimer = null;
+let pageChangeExternal = false;
+function notePageMayHaveChanged(external = false) {
+  pageChangeExternal = pageChangeExternal || external;
+  clearTimeout(pageChangeTimer);
+  pageChangeTimer = setTimeout(() => {
+    const wasExternal = pageChangeExternal;
+    pageChangeExternal = false;
+    send('page:maybe-changed', { external: wasExternal });
+  }, 200);
+}
+
 function markSelfWrite(p) {
   selfWrites.set(path.resolve(p), Date.now());
+  notePageMayHaveChanged();
 }
 
 ipcMain.handle('watch:start', async (_e, projectPath) => {
@@ -1128,10 +1801,25 @@ ipcMain.handle('watch:start', async (_e, projectPath) => {
   let pending = new Set();
   let timer = null;
   let cmsTimer = null;
+  let srcAssetTimer = null;
+  let cssTimer = null;
 
   watcher = fs.watch(srcDir, { recursive: true }, (_event, filename) => {
     if (!filename) return;
     const name = filename.toString();
+    // ANYTHING under src/ can be the difference between a page and the dev
+    // server's error screen: a .ts a component imports, a JSON file it reads,
+    // an image an import points at. This used to be said only for the file
+    // kinds the app itself edits, so breaking a .ts in an editor and fixing it
+    // there left the preview on the error screen with nothing to nudge it —
+    // the poll that gets it back only starts once a probe has failed, and no
+    // probe was ever asked for.
+    //
+    // The app's own writes say it through markSelfWrite instead, which is why
+    // they are skipped here.
+    const changed = path.join(srcDir, name);
+    const mine = selfWrites.get(path.resolve(changed));
+    if (!(mine && Date.now() - mine < 1000)) notePageMayHaveChanged(true);
     // JSON data files feed the CMS panel, not the page model.
     if (/\.json$/i.test(name)) {
       const full = path.join(srcDir, name);
@@ -1141,12 +1829,33 @@ ipcMain.handle('watch:start', async (_e, projectPath) => {
       cmsTimer = setTimeout(() => send('cms:changed', {}), 200);
       return;
     }
-    if (!/\.(astro|md|html)$/i.test(name)) return;
+    // Media under src/ is listed by the Assets panel now, so it has to hear
+    // about changes there the same way it hears about public/.
+    if (MEDIA_EXT.test(name)) {
+      const full = path.join(srcDir, name);
+      const wrote = selfWrites.get(path.resolve(full));
+      if (wrote && Date.now() - wrote < 1000) return;
+      clearTimeout(srcAssetTimer);
+      srcAssetTimer = setTimeout(() => send('assets:changed', {}), 200);
+      return;
+    }
+    if (/\.css$/i.test(name)) {
+      const full = path.join(srcDir, name);
+      const wrote = selfWrites.get(path.resolve(full));
+      if (wrote && Date.now() - wrote < 1000) return;
+      clearTimeout(cssTimer);
+      cssTimer = setTimeout(() => send('css:changed', {}), 200);
+      return;
+    }
+    if (!/\.(astro|md|mdx|html)$/i.test(name)) return;
     const full = path.join(srcDir, name);
     // Ignore events caused by the app's own recent writes.
     const wrote = selfWrites.get(path.resolve(full));
     if (wrote && Date.now() - wrote < 1000) return;
     pending.add(full);
+    // The site changed, so its picture is out of date — but not urgently, and
+    // not while the user is still typing.
+    scheduleThumb(projectPath, 60000);
     clearTimeout(timer);
     timer = setTimeout(() => {
       const files = [...pending];
@@ -1185,10 +1894,33 @@ let assetsWatcher = null;
 
 const publicDirOf = (projectPath) => path.join(projectPath, 'public');
 
-// Refuses paths that escape public/.
+// Assets live in two places and they mean different things:
+//
+//   public/  copied to the site as-is; referenced by URL ("/hero.png")
+//   src/     imported by the build; referenced by ESM import, and optimised
+//            (this is where <Image> wants its images)
+//
+// So an asset is addressed by a ROOTED rel — "public/img/hero.png" or
+// "src/assets/hero.png" — and every handler below takes that. The root is the
+// first segment, which keeps one string identifying a file across listing,
+// moving, renaming and picking, and makes a cross-root move just a move.
+const ASSET_ROOTS = ['public', 'src'];
+
+// Media only under src/: everything else there is code. public/ lists whatever
+// is in it — that folder exists to be served.
+const MEDIA_EXT =
+  /\.(png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?|mp4|webm|mov|m4v|ogv|mp3|wav|ogg|m4a|flac|aac|woff2?|ttf|otf|eot)$/i;
+
+const rootOfRel = (rel) => String(rel || '').split('/')[0];
+
+// Refuses anything that escapes the two roots.
 function assetAbs(projectPath, rel) {
-  const abs = path.resolve(publicDirOf(projectPath), rel || '');
-  if (!abs.startsWith(path.resolve(publicDirOf(projectPath)))) {
+  const clean = String(rel || '').replace(/^\/+/, '');
+  const root = rootOfRel(clean);
+  if (!ASSET_ROOTS.includes(root)) throw new Error('Invalid asset path');
+  const rootAbs = path.resolve(projectPath, root);
+  const abs = path.resolve(projectPath, clean);
+  if (abs !== rootAbs && !abs.startsWith(rootAbs + path.sep)) {
     throw new Error('Invalid asset path');
   }
   return abs;
@@ -1207,24 +1939,38 @@ function uniqueDest(dir, name) {
 }
 
 ipcMain.handle('assets:list', async (_e, projectPath) => {
-  const root = publicDirOf(projectPath);
   const entries = [];
-  if (!fs.existsSync(root)) return { entries, missing: true };
-  const walk = (dir, rel) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name.startsWith('.')) continue;
+  // Folders are only worth showing when something is in them, which for src/
+  // means "holds media somewhere below" — otherwise every component folder in
+  // the project would show up as an empty asset folder.
+  const walk = (dir, rel, mediaOnly) => {
+    let held = false;
+    let names = [];
+    try {
+      names = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    for (const entry of names) {
+      if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
       const full = path.join(dir, entry.name);
-      const entryRel = rel ? `${rel}/${entry.name}` : entry.name;
+      const entryRel = `${rel}/${entry.name}`;
       if (entry.isDirectory()) {
-        entries.push({ rel: entryRel, name: entry.name, parent: rel, isDir: true });
-        walk(full, entryRel);
+        const at = entries.length;
+        const placeholder = { rel: entryRel, name: entry.name, parent: rel, isDir: true, root: rootOfRel(rel) };
+        entries.push(placeholder);
+        const any = walk(full, entryRel, mediaOnly);
+        if (any) held = true;
+        else if (mediaOnly) entries.splice(at, 1); // nothing below it — not an asset folder
       } else {
+        if (mediaOnly && !MEDIA_EXT.test(entry.name)) continue;
         let size = 0;
         try {
           size = fs.statSync(full).size;
         } catch {
           /* race */
         }
+        held = true;
         entries.push({
           rel: entryRel,
           name: entry.name,
@@ -1232,12 +1978,27 @@ ipcMain.handle('assets:list', async (_e, projectPath) => {
           isDir: false,
           size,
           abs: full,
+          root: rootOfRel(rel),
         });
       }
     }
+    return held;
   };
-  walk(root, '');
-  return { entries };
+
+  // The roots themselves are entries, so the panel navigates and drops into
+  // them with the folder handling it already has.
+  const publicDir = publicDirOf(projectPath);
+  const srcDir = path.join(projectPath, 'src');
+  const hasPublic = fs.existsSync(publicDir);
+  if (hasPublic) {
+    entries.push({ rel: 'public', name: 'public', parent: '', isDir: true, root: 'public', isRoot: true });
+    walk(publicDir, 'public', false);
+  }
+  if (fs.existsSync(srcDir)) {
+    entries.push({ rel: 'src', name: 'src', parent: '', isDir: true, root: 'src', isRoot: true });
+    walk(srcDir, 'src', true);
+  }
+  return { entries, missing: !hasPublic };
 });
 
 // Opens a picker and copies the chosen files into public/<destRel>.
@@ -1276,6 +2037,17 @@ function copyAssetsIn(projectPath, destRel, filePaths) {
 ipcMain.handle('assets:move', async (_e, { projectPath, fromRel, toDirRel }) => {
   const from = assetAbs(projectPath, fromRel);
   const toDir = assetAbs(projectPath, toDirRel);
+  // Between roots the file's IDENTITY changes, not just its path: a public/
+  // asset is referenced by URL and a src/ one by import, so every reference to
+  // it would have to be rewritten in place. Until that rewrite exists, refuse
+  // — moving the file alone would leave the site pointing at nothing, quietly.
+  if (rootOfRel(fromRel) !== rootOfRel(toDirRel)) {
+    throw new Error(
+      'Moving between public/ and src/ changes how the file is referenced ' +
+        '(URL vs import), so it needs the references updated too. Not supported yet — ' +
+        'move it outside the app and fix the references by hand.'
+    );
+  }
   if (!fs.existsSync(from)) return { ok: false };
   // Refuse moving a folder into itself/its own subtree.
   if (fs.statSync(from).isDirectory() && (toDir === from || toDir.startsWith(from + path.sep))) {
@@ -1300,6 +2072,19 @@ ipcMain.handle('assets:rename', async (_e, { projectPath, rel, newName }) => {
   markSelfWrite(from);
   markSelfWrite(dest);
   fs.renameSync(from, dest);
+  send('assets:changed', {});
+  return { ok: true };
+});
+
+// To the system's bin, not to nothing. An asset is somebody's photograph as
+// often as it is a placeholder, references to it live in files this does not
+// read, and the app has no copy of it — so "gone" has to mean somewhere they
+// can get it back from without us.
+ipcMain.handle('assets:delete', async (_e, { projectPath, rel }) => {
+  const abs = assetAbs(projectPath, rel);
+  if (!fs.existsSync(abs)) return { ok: false };
+  markSelfWrite(abs);
+  await shell.trashItem(abs);
   send('assets:changed', {});
   return { ok: true };
 });
@@ -1341,6 +2126,38 @@ const MAX_CMS_BYTES = 2 * 1024 * 1024;
 // Config files that happen to live in src/ aren't content.
 const CMS_SKIP = /^(tsconfig|jsconfig|package|package-lock|env\.d)\.json$/i;
 
+// How a page's frontmatter is scanned: no exports there, and a list of plain
+// strings is the content itself rather than a constant.
+const PAGE_SCAN = { requireExport: false, allowPlainLists: true };
+
+const isAstroRel = (rel) => /\.astro$/i.test(String(rel || ''));
+
+// The frontmatter's own span, so a page's data can be read and written without
+// the scanners ever seeing its markup.
+function frontmatterSpan(source) {
+  const open = /^---[ \t]*\r?\n/.exec(source);
+  if (!open) return null;
+  const start = open[0].length;
+  const close = source.slice(start).search(/\r?\n---[ \t]*(\r?\n|$)/);
+  if (close === -1) return null;
+  return { start, end: start + close };
+}
+
+function frontmatterOf(source) {
+  const span = frontmatterSpan(source);
+  return span ? source.slice(span.start, span.end) : null;
+}
+
+// A JS/TS collection is addressed as `path/to/file.ts#EXPORT_NAME` — the file
+// holds several, so the export name picks which one. A page's frontmatter uses
+// the same form: `pages/index.astro#rotatingWords`.
+function splitCmsRel(rel) {
+  const at = String(rel || '').lastIndexOf('#');
+  return at === -1
+    ? { fileRel: String(rel || ''), exportName: null }
+    : { fileRel: String(rel).slice(0, at), exportName: String(rel).slice(at + 1) };
+}
+
 // Refuses paths that escape src/.
 function cmsAbs(projectPath, rel) {
   const root = path.resolve(projectPath, 'src');
@@ -1369,6 +2186,83 @@ ipcMain.handle('cms:list', async (_e, projectPath) => {
       const entryRel = rel ? `${rel}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
         walk(full, entryRel);
+      } else if (/\.(ts|js|mjs|mts)$/i.test(entry.name) && !/\.d\.ts$/i.test(entry.name)) {
+        // Exported record arrays edit like a JSON collection. They're grouped
+        // under their file rather than their folder, since one file usually
+        // holds several and the folder alone wouldn't tell them apart.
+        let source = '';
+        try {
+          if (fs.statSync(full).size > MAX_CMS_BYTES) continue;
+          source = fs.readFileSync(full, 'utf8');
+        } catch {
+          continue;
+        }
+        if (!/export\s+const\s+[A-Za-z_$][\w$]*\s*(?::[^=]+)?=\s*\[/.test(source)) continue;
+        // Single values (site name, url, a count) have no rows to repeat, so
+        // they ride together as one "General" record at the top of the file's
+        // group rather than being invisible.
+        const general = readGeneral(source);
+        if (general) {
+          files.push({
+            rel: `${entryRel}#${GENERAL}`,
+            name: 'General',
+            dir: entryRel,
+            abs: full,
+            fromFile: true,
+            data: general,
+          });
+        }
+        for (const col of findCollections(source)) {
+          if (!col.data) continue; // computed contents — nothing safe to write back
+          files.push({
+            rel: `${entryRel}#${col.name}`,
+            name: col.name,
+            dir: entryRel, // the file is the group
+            abs: full,
+            fromFile: true,
+            data: col.data,
+          });
+        }
+      } else if (/\.astro$/i.test(entry.name)) {
+        // A page's own data — the lists and values declared in its
+        // frontmatter — edits like any other collection, grouped under the
+        // page. Nothing is exported there, and a list of plain strings is
+        // content rather than a constant, so the scan is told both.
+        let source = '';
+        try {
+          if (fs.statSync(full).size > MAX_CMS_BYTES) continue;
+          source = fs.readFileSync(full, 'utf8');
+        } catch {
+          continue;
+        }
+        const body = frontmatterOf(source);
+        if (!body) continue;
+        // Single values ride together as one "General" record, the same way a
+        // data file's do.
+        const general = readGeneral(body, PAGE_SCAN);
+        if (general) {
+          files.push({
+            rel: `${entryRel}#${GENERAL}`,
+            name: 'General',
+            dir: entryRel,
+            abs: full,
+            fromFile: true,
+            fromPage: true,
+            data: general,
+          });
+        }
+        for (const col of findCollections(body, PAGE_SCAN)) {
+          if (!col.data) continue;
+          files.push({
+            rel: `${entryRel}#${col.name}`,
+            name: col.name,
+            dir: entryRel,
+            abs: full,
+            fromFile: true,
+            fromPage: true,
+            data: col.data,
+          });
+        }
       } else if (/\.json$/i.test(entry.name) && !CMS_SKIP.test(entry.name)) {
         const file = { rel: entryRel, name: entry.name, dir: rel, abs: full };
         try {
@@ -1392,13 +2286,64 @@ ipcMain.handle('cms:list', async (_e, projectPath) => {
 });
 
 ipcMain.handle('cms:read', async (_e, { projectPath, rel }) => {
-  const abs = cmsAbs(projectPath, rel);
-  return { data: JSON.parse(fs.readFileSync(abs, 'utf8')) };
+  const { fileRel, exportName } = splitCmsRel(rel);
+  const abs = cmsAbs(projectPath, fileRel);
+  if (!exportName) return { data: JSON.parse(fs.readFileSync(abs, 'utf8')) };
+  const file = fs.readFileSync(abs, 'utf8');
+  // A page's data lives in its frontmatter; everything below it is markup the
+  // scanners must never see.
+  const page = isAstroRel(fileRel);
+  const source = page ? frontmatterOf(file) : file;
+  if (source == null) throw new Error(`src/${fileRel} has no frontmatter.`);
+  const scan = page ? PAGE_SCAN : undefined;
+  if (exportName === GENERAL) {
+    const general = readGeneral(source, scan);
+    if (!general) throw new Error(`src/${fileRel} has no single values left to edit.`);
+    return { data: general };
+  }
+  const col = findCollections(source, scan).find((c) => c.name === exportName);
+  if (!col) {
+    throw new Error(
+      page
+        ? `${exportName} is no longer declared in src/${fileRel}.`
+        : `${exportName} is no longer exported from src/${fileRel}.`
+    );
+  }
+  if (!col.data) throw new Error(`${exportName} isn't plain data — ${col.reason}.`);
+  return { data: col.data };
 });
 
 // Writes the collection back, matching the file's existing indentation so
 // the diff stays limited to what the user actually changed.
 ipcMain.handle('cms:write', async (_e, { projectPath, rel, data }) => {
+  const { fileRel, exportName } = splitCmsRel(rel);
+  if (exportName) {
+    const abs = cmsAbs(projectPath, fileRel);
+    if (!fs.existsSync(abs)) throw new Error(`src/${fileRel} no longer exists.`);
+    // Only the edited span is rewritten — imports, comments and the file's
+    // other exports are left exactly as they were.
+    const file = fs.readFileSync(abs, 'utf8');
+    // Only the frontmatter is handed to the writer for a page, and only its
+    // span is spliced back — the markup below is never re-serialized.
+    const page = isAstroRel(fileRel);
+    const span = page ? frontmatterSpan(file) : null;
+    if (page && !span) throw new Error(`src/${fileRel} has no frontmatter.`);
+    const source = page ? file.slice(span.start, span.end) : file;
+    const scan = page ? PAGE_SCAN : undefined;
+    const written =
+      exportName === GENERAL
+        ? writeGeneral(source, data && typeof data === 'object' && !Array.isArray(data) ? data : {}, scan)
+        : replaceCollection(source, exportName, data, scan);
+    if (written == null) throw new Error(`Couldn't write ${exportName} back into src/${fileRel}.`);
+    const next = page ? file.slice(0, span.start) + written + file.slice(span.end) : written;
+    markSelfWrite(abs);
+    fs.writeFileSync(abs, next, 'utf8');
+    // Editing a page's own frontmatter changes a file the editor may have
+    // open. Our writes are invisible to the watcher, so say so directly —
+    // otherwise the model would keep the old data and write it back over this.
+    if (page) send('fs:changed', { files: [abs] });
+    return { ok: true };
+  }
   const abs = cmsAbs(projectPath, rel);
   // A save still in flight when the collection is deleted must not recreate
   // the file — the editor closes a moment after the delete lands.
@@ -1444,6 +2389,185 @@ function readCmsMeta(projectPath) {
 
 ipcMain.handle('cms:meta', async (_e, projectPath) => ({ meta: readCmsMeta(projectPath) }));
 
+// What the project's content config declares: every collection, where its
+// entries live, whether they can be written at all, and the JSON Schema its
+// zod schema amounts to. Read from the config itself rather than inferred from
+// the data, so the editor enforces the same rules the build does — see
+// contentConfig.js for how, and why it happens in a child process.
+ipcMain.handle('content:config', async (_e, { projectPath, force } = {}) =>
+  readContentConfig(projectPath, { force: !!force })
+);
+
+// One collection's entries: where each one lives, what it holds, and what
+// identifies it. A collection whose loader builds its entries has none to give.
+const collectionOf = async (projectPath, name) => {
+  const config = await readContentConfig(projectPath);
+  const collection = (config.collections || []).find((c) => c.name === name);
+  if (!collection) throw new Error(`${name} is not a collection in this project.`);
+  return { config, collection };
+};
+
+// The collections themselves, with counts, for the panel that lists them.
+// Every CSS custom property in the project, grouped the way the stylesheets
+// themselves group them — see cssVars.js for what "the way" means.
+ipcMain.handle('css:variables', async (_e, projectPath) => {
+  try {
+    return cssVars.readVariables(projectPath);
+  } catch (err) {
+    return { files: [], error: String(err.message || err) };
+  }
+});
+
+// A variable added at the bottom of a group. One call carries several: a row in
+// a table of modes is one name in every mode, and a row in a family is one
+// property of every member.
+ipcMain.handle('css:addVariables', async (_e, { projectPath, adds }) => {
+  let last = { ok: true };
+  for (const add of adds || []) {
+    markSelfWrite(path.resolve(projectPath, add.file));
+    last = cssVars.addVariable(projectPath, add);
+    if (!last.ok) break;
+  }
+  if (last.ok) send('css:changed', {});
+  return last;
+});
+
+// A row dragged to a new place: the declaration moves inside its rule, which is
+// where the order actually lives.
+ipcMain.handle('css:moveVariables', async (_e, { projectPath, moves }) => {
+  let last = { ok: true };
+  for (const move of moves || []) {
+    markSelfWrite(path.resolve(projectPath, move.file));
+    // A group carries its heading and every line under it; a row is one line.
+    last = move.names ? cssVars.moveSection(projectPath, move) : cssVars.moveVariable(projectPath, move);
+    if (!last.ok) break;
+  }
+  if (last.ok) send('css:changed', {});
+  return last;
+});
+
+// A heading that is a comment rather than a shared name: renaming it rewrites
+// the comment, in place, the same way a value is written.
+ipcMain.handle('css:setSectionTitle', async (_e, { projectPath, ...edit }) => {
+  markSelfWrite(path.resolve(projectPath, edit.file));
+  const result = cssVars.setSectionTitle(projectPath, edit);
+  if (result.ok) send('css:changed', {});
+  return result;
+});
+
+// A heading is a line between declarations: removing it joins the runs either
+// side, and adding one splits them.
+ipcMain.handle('css:removeSection', async (_e, { projectPath, ...edit }) => {
+  markSelfWrite(path.resolve(projectPath, edit.file));
+  const result = cssVars.removeSection(projectPath, edit);
+  if (result.ok) send('css:changed', {});
+  return result;
+});
+
+ipcMain.handle('css:moveHeading', async (_e, { projectPath, ...edit }) => {
+  markSelfWrite(path.resolve(projectPath, edit.file));
+  const result = cssVars.moveHeading(projectPath, edit);
+  if (result.ok) send('css:changed', {});
+  return result;
+});
+
+ipcMain.handle('css:addSection', async (_e, { projectPath, ...edit }) => {
+  markSelfWrite(path.resolve(projectPath, edit.file));
+  const result = cssVars.addSection(projectPath, edit);
+  if (result.ok) send('css:changed', {});
+  return result;
+});
+
+// Renaming reaches every file that mentions the name, so it is one call rather
+// than one per file: the panel says which names become which, and either all of
+// them move or none does.
+ipcMain.handle('css:renameVariables', async (_e, { projectPath, renames }) => {
+  const result = cssVars.renameVariables(projectPath, { renames, markWrite: markSelfWrite });
+  if (result.ok) send('css:changed', {});
+  return result;
+});
+
+// One value, replaced where it sits. The old value is sent back with the new
+// one: if the file no longer says what the panel was showing, somebody else has
+// edited it and the offsets are meaningless.
+ipcMain.handle('css:setVariable', async (_e, { projectPath, ...edit }) => {
+  const abs = path.resolve(projectPath, edit.file);
+  markSelfWrite(abs);
+  const result = cssVars.setVariable(projectPath, edit);
+  if (result.ok) send('css:changed', {});
+  return result;
+});
+
+ipcMain.handle('content:collections', async (_e, projectPath) => {
+  const config = await readContentConfig(projectPath);
+  if (config.missing || config.error) return { ...config, collections: [] };
+  const collections = (config.collections || []).map((collection) => ({
+    name: collection.name,
+    editable: collection.editable,
+    loader: collection.loader,
+    hasSchema: !!collection.schema,
+    freeform: !!collection.freeform,
+    error: collection.error || null,
+    count: countEntries(projectPath, collection),
+  }));
+  return { collections, covered: coveredPaths(config.collections || []), configPath: config.configPath };
+});
+
+ipcMain.handle('content:entries', async (_e, { projectPath, name }) => {
+  const { collection } = await collectionOf(projectPath, name);
+  return { collection, ...listEntries(projectPath, collection) };
+});
+
+// A save is a list of edits against one entry, not a new copy of the file: see
+// contentEntries.js and ./formats for what that protects.
+ipcMain.handle('content:writeEntry', async (_e, { projectPath, entry, edits, body }) => {
+  const result = writeEntry(projectPath, entry, edits || [], { body });
+  markSelfWrite(path.resolve(projectPath, entry.file));
+  send('cms:changed', {});
+  return result;
+});
+
+ipcMain.handle('content:validate', async (_e, { projectPath, collection, data }) =>
+  validateEntry(projectPath, { collection, data })
+);
+
+// What renaming an entry's id would change, and then changing it. Two calls,
+// because an id is what every reference to the entry holds: the plan is shown
+// before anything is written, so a rename that would touch six other entries
+// says so first.
+ipcMain.handle('content:renamePlan', async (_e, { projectPath, name, from, to }) => {
+  const config = await readContentConfig(projectPath);
+  const plan = planRename(projectPath, config.collections || [], { collection: name, from, to });
+  // The entry data itself is big and the renderer only needs the shape of the
+  // change.
+  return { ...plan, entry: { id: plan.entry.id, file: plan.entry.file } };
+});
+
+ipcMain.handle('content:rename', async (_e, { projectPath, name, from, to }) => {
+  const config = await readContentConfig(projectPath);
+  const plan = planRename(projectPath, config.collections || [], { collection: name, from, to });
+  const result = applyRename(projectPath, plan);
+  for (const file of result.files) markSelfWrite(path.resolve(projectPath, file));
+  send('cms:changed', {});
+  return result;
+});
+
+// Every entry of a collection something can point at, as id and label — what a
+// reference field offers instead of asking the user to remember ids.
+ipcMain.handle('content:targets', async (_e, { projectPath, name }) => {
+  const { collection } = await collectionOf(projectPath, name);
+  const { entries } = listEntries(projectPath, collection);
+  return { targets: entries.map((e) => ({ id: e.id, title: e.title })) };
+});
+
+// Where an import in a page actually points. The tag name is only a local
+// binding — `import Layout from '@/layouts/BaseLayout.astro'` renders as
+// <Layout> — so drilling into a component has to follow the import, not the
+// name.
+ipcMain.handle('project:resolveImport', async (_e, { projectPath, fromFile, spec }) => ({
+  path: resolveImport(projectPath, fromFile, spec),
+}));
+
 ipcMain.handle('cms:setMeta', async (_e, { projectPath, rel, fields }) => {
   const meta = readCmsMeta(projectPath);
   if (fields && Object.keys(fields).length) meta[rel] = fields;
@@ -1459,11 +2583,16 @@ ipcMain.handle('cms:setMeta', async (_e, { projectPath, rel, fields }) => {
 // `clients.map(...)` on the page working and rendering nothing.
 
 ipcMain.handle('cms:usage', async (_e, { projectPath, rel }) => {
-  const abs = cmsAbs(projectPath, rel);
+  const abs = cmsAbs(projectPath, splitCmsRel(rel).fileRel);
   return { files: importersOf(projectPath, abs).map((h) => h.rel) };
 });
 
 ipcMain.handle('cms:delete', async (_e, { projectPath, rel }) => {
+  // An export shares its file with other code, so there's no file to trash and
+  // removing the statement is a code edit, not a content one.
+  if (splitCmsRel(rel).exportName) {
+    throw new Error('This collection is an export inside a source file — remove it in code.');
+  }
   const abs = cmsAbs(projectPath, rel);
   const hits = importersOf(projectPath, abs);
   for (const hit of hits) {
@@ -1521,8 +2650,11 @@ function writeChunks(model) {
 
 ipcMain.handle('page:read', async (_e, pagePath) => {
   const source = fs.readFileSync(pagePath, 'utf8');
-  if (pagePath.endsWith('.md')) {
-    return { editable: false, reason: 'Markdown pages open in code view.', source };
+  // Markdown builds the same tree from a different syntax, so everything
+  // downstream — navigator, props, text editing, undo — is unchanged. Only
+  // the writer has to know which one it is; model.format carries that.
+  if (isMarkdownPage(pagePath)) {
+    return { ...parseMarkdownPage(source, { mdx: isMdx(pagePath) }), source };
   }
   const parsed = parsePage(source);
   if (parsed.editable) resolveChunks(parsed.model, pagePath);
@@ -1562,6 +2694,10 @@ function writePageText(pagePath, text) {
 }
 
 ipcMain.handle('page:write', async (_e, { pagePath, model }) => {
+  if (isMarkdownPage(pagePath)) {
+    writePageText(pagePath, serializeMarkdownPage(model));
+    return { ok: true };
+  }
   writePageText(pagePath, serializePage(model));
   writeChunks(model);
   return { ok: true };
@@ -1662,6 +2798,91 @@ ipcMain.handle('pagefolder:delete', async (_e, { projectPath, dir }) => {
   return { ok: true };
 });
 
+// Fill a route pattern in with one entry's params: /posts/[slug] + {slug:'a'}
+// → /posts/a. A rest param ([...path]) holds a whole segment run, and an
+// undefined one collapses rather than writing "undefined" into the URL.
+function fillRoute(pattern, params) {
+  const filled = pattern.replace(/\[(\.\.\.)?([^\]]+)\]/g, (_m, rest, name) => {
+    const value = params?.[name];
+    if (value == null) return '';
+    return String(value)
+      .split('/')
+      .map((s) => encodeURIComponent(s))
+      .join('/');
+  });
+  // A dropped rest param leaves a double slash or a trailing one behind.
+  return filled.replace(/\/{2,}/g, '/').replace(/(.)\/$/, '$1');
+}
+
+// Routes the project serves that are NOT files under src/pages — pages an
+// integration injected (issue #7). The site's own repo may have none of its
+// own at all, in which case these are the only pages there are. Preview only:
+// their source lives inside a dependency, so nothing here is editable, and
+// they are deliberately kept out of the page list the editor writes through.
+ipcMain.handle('project:injectedRoutes', async (_e, { projectPath }) => ({
+  routes: readInjectedRoutes(projectPath),
+}));
+
+// The concrete URLs a dynamic page stands for, by asking the dev server to run
+// its getStaticPaths. Returns [] for a static page, and for any failure — a
+// page that can't answer is previewed at its own pattern, exactly as before.
+ipcMain.handle('page:dynamicPaths', async (_e, { projectPath, pagePath, devUrl }) => {
+  const pattern = routeForPage(projectPath, pagePath);
+  if (!pattern.includes('[') || !devUrl) return { entries: [] };
+  const rel = toPosix(path.relative(projectPath, pagePath));
+  try {
+    const res = await fetch(`${devUrl}/__avb/paths?p=${encodeURIComponent(rel)}`);
+    if (!res.ok) return { entries: [], error: `Dev server returned ${res.status}` };
+    const data = await res.json();
+    const entries = (data.entries || []).map((e) => {
+      // A dev server started before this app was updated still answers with
+      // bare params objects — read both shapes rather than break its preview.
+      const params = e && e.params ? e.params : e;
+      return {
+        params,
+        props: (e && e.props) || null,
+        route: fillRoute(pattern, params),
+        // The values themselves read better in a picker than "slug=hello-world".
+        label: Object.values(params).map(String).join(' / ') || pattern,
+      };
+    });
+    return { entries, error: data.error || null };
+  } catch (err) {
+    return { entries: [], error: String(err?.message || err) };
+  }
+});
+
+// One entry of a collection, sampled — what a picker shows beside the fields
+// of a page that lists them. Answered by the dev server because only it can
+// run the project's loaders; without one there is simply no sample.
+ipcMain.handle('content:sampleEntry', async (_e, { devUrl, name, id }) => {
+  if (!devUrl || !name) return { entry: null };
+  try {
+    const q = `c=${encodeURIComponent(name)}${id ? `&id=${encodeURIComponent(id)}` : ''}`;
+    const res = await fetch(`${devUrl}/__avb/data?${q}`);
+    if (!res.ok) return { entry: null, error: `Dev server returned ${res.status}` };
+    return await res.json();
+  } catch (err) {
+    return { entry: null, error: String(err?.message || err) };
+  }
+});
+
+// Turn a piece of a page into a component of its own. The file is worked out
+// in componentFile.js; writing it belongs here, with every other write.
+ipcMain.handle('component:create', async (_e, opts) => {
+  const { path: target, rel, text } = componentFile(opts);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  markSelfWrite(target);
+  fs.writeFileSync(target, text, 'utf8');
+  return { path: target, rel, name: opts.name };
+});
+
+// Which files hold instances of a component — the list behind the palette's
+// "23 instances".
+ipcMain.handle('component:usage', async (_e, { projectPath, name, exclude }) =>
+  componentUsage({ projectPath, name, exclude })
+);
+
 ipcMain.handle('page:importPathFor', async (_e, { pagePath, targetPath, projectPath }) => {
   const rel = toPosix(path.relative(path.dirname(pagePath), targetPath));
   const relative = rel.startsWith('.') ? rel : './' + rel;
@@ -1673,6 +2894,64 @@ ipcMain.handle('page:importPathFor', async (_e, { pagePath, targetPath, projectP
     }
   }
   return { relative, srcRelative };
+});
+
+// The same import, written for another page.
+//
+// A relative specifier says where a file is FROM WHERE IT IS WRITTEN, so
+// `../assets/hero.png` copied from src/pages/index.astro into
+// src/pages/blog/post.astro points at nothing. Anything else — an alias, a bare
+// package, `astro:content` — means the same thing wherever it is written, and
+// is handed back untouched.
+ipcMain.handle('page:rebaseImport', async (_e, { fromPagePath, toPagePath, spec }) => {
+  const text = String(spec || '');
+  if (!text.startsWith('.')) return { path: text };
+  if (!fromPagePath || !toPagePath) return { path: text };
+  const abs = path.resolve(path.dirname(fromPagePath), text);
+  const rel = toPosix(path.relative(path.dirname(toPagePath), abs));
+  return { path: rel.startsWith('.') ? rel : './' + rel };
+});
+
+// ---------------------------------------------------------------------------
+// Copy Selection (⇧⌘C)
+//
+// What the canvas has selected, as the editing-hierarchy trail that leads to
+// it: the page, then the instance of each component drilled into, then the
+// node itself — each entry a `<file>:<lines>` pointer. Pasted into an AI chat
+// that can read the project, that trail is the one thing it can't work out for
+// itself.
+//
+// Resolved on demand from the keys the renderer hands over, so nothing is
+// stored here and nothing is written to the user's project.
+// ---------------------------------------------------------------------------
+
+// Turns "<file>#<path>" node keys into "<file>:<line>" / "<file>:<from>-<to>"
+// pointers, project-relative. Returns null when there's nothing to point at.
+function selectionTrail(state) {
+  if (!state || !state.projectPath || !Array.isArray(state.keys)) return null;
+  const root = path.resolve(state.projectPath);
+  const trail = [];
+  for (const key of state.keys) {
+    const hash = typeof key === 'string' ? key.indexOf('#') : -1;
+    if (hash === -1) continue;
+    // The key's file half is renderer input; keep it inside the project.
+    const abs = path.resolve(root, key.slice(0, hash));
+    if (abs !== root && !abs.startsWith(root + path.sep)) continue;
+    const at = locateSelection(abs, key.slice(hash + 1));
+    if (!at) continue;
+    const file = toPosix(path.relative(root, at.file));
+    if (at.startLine == null) trail.push(file);
+    else if (at.startLine === at.endLine) trail.push(`${file}:${at.startLine}`);
+    else trail.push(`${file}:${at.startLine}-${at.endLine}`);
+  }
+  return trail.length ? trail : null;
+}
+
+ipcMain.handle('selection:copy', async (_e, state) => {
+  const trail = selectionTrail(state);
+  if (!trail) return { ok: false };
+  clipboard.writeText(trail.join('\n'));
+  return { ok: true, count: trail.length };
 });
 
 // ---------------------------------------------------------------------------
@@ -1763,6 +3042,139 @@ function parseExistingServer(log) {
 // headings, wrappers) render something visible instead of an empty shell.
 // The stage lays out at a desktop width, then a fit script scales the
 // rendered content to fill the card.
+// Which concrete URLs a dynamic route ([slug].astro) actually stands for.
+//
+// getStaticPaths is ordinary JS — it can read a content collection, hit an API,
+// map over anything — so the only reliable way to know its paths is to run it,
+// and the only thing that can run it is the dev server itself. Hence an
+// injected endpoint rather than parsing the frontmatter.
+//
+// The page module is imported lazily through a glob: importing it evaluates
+// module scope (where getStaticPaths lives) but not the component body, so
+// nothing that needs Astro.params runs here.
+const PATHS_ENDPOINT = `// Generated by Stacki (dev preview only) — do not edit.
+export const prerender = false;
+
+const pages = import.meta.glob('/src/pages/**/*.{astro,md,mdx}');
+
+// getStaticPaths' props ARE the page's Astro.props — the only place the editor
+// can see REAL data for a dynamic route, the entry behind the canvas with its
+// values in it. What crosses the wire is a SAMPLE, not the data: long strings
+// are clipped, long lists cut short, deep nesting stopped, and anything JSON
+// can't hold (a function, a symbol) dropped. Enough to show a designer what a
+// field holds and what it is called; never enough to be worth its weight.
+const MAX_STRING = 160;
+const MAX_ITEMS = 8;
+const MAX_DEPTH = 6;
+export function sample(value, depth) {
+  const d = depth || 0;
+  if (value === null || value === undefined) return null;
+  const t = typeof value;
+  if (t === 'string') return value.length > MAX_STRING ? value.slice(0, MAX_STRING) + '…' : value;
+  if (t === 'number' || t === 'boolean') return value;
+  if (t !== 'object') return undefined; // functions, symbols, bigints
+  // A date is a value, not a shape: kept as one, tagged so the editor can say
+  // "date" rather than showing an object with no keys.
+  if (value instanceof Date)
+    return { __stacki: 'date', value: isNaN(value.getTime()) ? null : value.toISOString() };
+  if (d >= MAX_DEPTH) return { __stacki: 'deep' };
+  if (Array.isArray(value)) {
+    const out = value.slice(0, MAX_ITEMS).map((v) => {
+      const s = sample(v, d + 1);
+      return s === undefined ? null : s;
+    });
+    if (value.length > MAX_ITEMS) out.push({ __stacki: 'more', count: value.length - MAX_ITEMS });
+    return out;
+  }
+  const out = {};
+  for (const key of Object.keys(value)) {
+    let s;
+    try {
+      s = sample(value[key], d + 1);
+    } catch {
+      continue; // a getter that throws is not worth the whole entry
+    }
+    if (s !== undefined) out[key] = s;
+  }
+  return out;
+}
+
+// Named for the importer's sake: /__avb/data samples entries the same way.
+export const SAMPLE = sample;
+
+export async function GET({ url }) {
+  const rel = url.searchParams.get('p') || '';
+  const body = { entries: [], error: null };
+  try {
+    // The glob keys are project-root-absolute, matching what the app sends.
+    const load = pages['/' + rel.replace(/^\\/+/, '')];
+    if (!load) {
+      body.error = 'Page not found: ' + rel;
+    } else {
+      const mod = await load();
+      if (typeof mod.getStaticPaths === 'function') {
+        const result = await mod.getStaticPaths();
+        body.entries = (Array.isArray(result) ? result : [])
+          .filter((e) => e && typeof e === 'object' && e.params && typeof e.params === 'object')
+          .map((e, i) => ({
+            params: e.params,
+            // Only the first few: the editor shows ONE entry's data at a time,
+            // and a collection of 400 posts would otherwise cross the wire in
+            // full every time the frontmatter changes.
+            props: i < 30 ? sample(e.props) : null,
+          }));
+      }
+    }
+  } catch (err) {
+    body.error = String((err && err.message) || err);
+  }
+  return new Response(JSON.stringify(body), {
+    headers: { 'content-type': 'application/json' },
+  });
+}
+`;
+
+// The other half of the picker's data: a page that never declares
+// getStaticPaths still reads collections in its frontmatter
+// (`const posts = await getCollection("blog")`), and that is the common list
+// page. One entry is all a picker needs to show what a post HAS.
+const DATA_ENDPOINT = `// Generated by Stacki (dev preview only) — do not edit.
+export const prerender = false;
+
+import { SAMPLE } from './paths.js';
+
+export async function GET({ url }) {
+  const name = url.searchParams.get('c') || '';
+  // A particular entry when the editor knows which one — a reference names it
+  // — and otherwise the first, which is enough to show what a collection has.
+  const id = url.searchParams.get('id') || '';
+  const body = { entry: null, error: null };
+  if (!/^[\\w-]+$/.test(name) || (id && (!/^[\\w\\-./]+$/.test(id) || id.includes('..')))) {
+    body.error = 'Bad collection or entry name';
+    return json(body);
+  }
+  try {
+    // Imported here rather than at the top: a project with no content config
+    // has no astro:content to import, and this route must not take the dev
+    // server down with it.
+    const { getCollection, getEntry } = await import('astro:content');
+    if (id) {
+      const entry = await getEntry(name, id);
+      body.entry = entry ? SAMPLE(entry) : null;
+    } else {
+      const entries = await getCollection(name);
+      body.entry = entries && entries.length ? SAMPLE(entries[0]) : null;
+    }
+  } catch (err) {
+    body.error = String((err && err.message) || err);
+  }
+  return json(body);
+}
+
+const json = (body) =>
+  new Response(JSON.stringify(body), { headers: { 'content-type': 'application/json' } });
+`;
+
 const PREVIEW_PAGE = `---
 // Generated by Stacki (dev preview only) — do not edit.
 // On-demand so Astro.url keeps its query string (prerendered pages get
@@ -1886,10 +3298,48 @@ if (/^[A-Za-z][\\w-]*$/.test(name)) {
 </html>
 `;
 
+// The page patcher, handed to every page as a module. It lives in its own
+// file rather than as a string in here because it is real code that has to
+// stay readable — and it is read rather than required, since it runs in the
+// browser and not in this process. If it cannot be read, pages simply reload
+// the way they always did.
+let MORPH_CLIENT = '';
+try {
+  MORPH_CLIENT = fs.readFileSync(path.join(__dirname, 'morphClient.js'), 'utf8');
+} catch {
+  MORPH_CLIENT = '';
+}
+
+// `is:inline` so Astro leaves it exactly as written and the browser asks the
+// dev server for it — which is what puts it in the module graph, and what
+// gives it an import.meta.hot to listen on.
+const MORPH_TAG_HTML = MORPH_CLIENT
+  ? '<script type="module" src="/@id/__x00__virtual:avb-morph" is:inline></script>'
+  : '';
+
+// Node's own parser, asked the same question it will be asked at startup.
+// Cheap next to spawning a dev server, and it turns a whole class of mistake
+// in the generated config from "no preview" into "preview without extras".
+function parsesAsModule(file) {
+  try {
+    const bin = resolveNodeBin();
+    if (!bin) return true; // nothing to check with — let Astro have its say
+    const out = spawnSync(bin, ['--check', file], { encoding: 'utf8', timeout: 10000 });
+    if (out.error || out.status === null) return true; // check could not run
+    return out.status === 0;
+  } catch {
+    return true;
+  }
+}
+
 function writeMarkerConfig(projectPath) {
   try {
     const dir = path.join(projectPath, 'node_modules', '.avb');
     fs.mkdirSync(dir, { recursive: true });
+    // Stale until this run's astro:config:done writes it again; until then the
+    // config's own text is the better answer.
+    fs.rmSync(path.join(dir, 'resolved.json'), { force: true });
+    fs.rmSync(path.join(dir, 'routes.json'), { force: true });
     const userCfg = ['astro.config.mjs', 'astro.config.js', 'astro.config.ts'].find((f) =>
       fs.existsSync(path.join(projectPath, f))
     );
@@ -1902,9 +3352,11 @@ function writeMarkerConfig(projectPath) {
       .join(__dirname, 'astroParser.js')
       .replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`);
     const pagesDir = toPosix(path.join(projectPath, 'src', 'pages'));
+    const srcDir = toPosix(path.join(projectPath, 'src'));
+    const projectDirPosix = toPosix(projectPath);
     const cfg = `// Generated by Stacki (dev preview only) — do not edit.
 import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 ${userCfg ? `import userConfig from '../../${userCfg}';` : 'const userConfig = {};'}
 
 const require = createRequire(import.meta.url);
@@ -1912,10 +3364,107 @@ const { parsePage, serializePageMarked, resolveChunks, markChunkHtml } = require
       parserPath
     )});
 const PAGES_DIR = ${JSON.stringify(pagesDir)};
+const SRC_DIR = ${JSON.stringify(srcDir)};
+const PROJECT_DIR = ${JSON.stringify(projectDirPosix)};
+
+// A <template> marker is an element like any other: it sits between two
+// siblings and :nth-child counts it. Outside the canvas nothing needs it, so
+// the page takes those out itself.
+//
+// The comment markers stay. They are invisible to selectors, to layout and to
+// the box model, and they are the one thing on the page that says which node
+// is which — the patcher that replaces a full reload matches the server's new
+// rendering against the live document through them, and without them it would
+// be guessing from tag names. A comment in devtools is a small price for not
+// rebuilding an element that was only meant to change its text.
+const AVB_CLEANUP = [
+  '<script is:inline>',
+  "if (!location.hash.includes('avb-design')) {",
+  "  for (const t of document.querySelectorAll('template[data-avb-s],template[data-avb-e]')) t.remove();",
+  '}',
+  '</script>',
+].join('\\n');
 
 // Must hook \`load\` (not \`transform\`): Astro's own compiler plugin is also
 // enforce:'pre' and runs first, so a transform would receive compiled JS —
 // and returning Astro source at that point breaks the module graph.
+// Astro renders components on the server, so Vite cannot hot-swap one: any
+// edit to a page or a component it uses ends in "reload the document". A
+// reload restarts every CSS animation, rewinds every <video>, drops scroll
+// position and closes whatever the user had open — which in an editor is the
+// state you were looking at when you made the change.
+//
+// Everything else the dev server does is wanted, including stylesheet updates
+// and invalidation, so none of it is touched here. Only the one message that
+// throws the page away is caught, and turned into a request to patch the page
+// instead. Vite reaches the browser through more than one object and which
+// one Astro picks depends on its version, so every distinct channel is
+// wrapped; identity dedupes the ones that are really the same object.
+// What the <style> blocks of a file said the last time it was looked at.
+// Comparing the source rather than the compiled output is deliberate: Astro's
+// scope hash comes from the file's path, so identical style blocks compile to
+// identical CSS, and reading the file cannot disturb the module graph.
+const avbStyleText = new Map();
+const avbReadFile = (file) => {
+  try {
+    return readFileSync(file, 'utf8');
+  } catch {
+    return '';
+  }
+};
+const avbStyleTextOf = (src) => (src.match(/<style[^>]*>[\\s\\S]*?<\\/style>/gi) || []).join('\\n');
+const avbIsStyleModule = (m) => {
+  const u = m.url || m.id || '';
+  return u.indexOf('type=style') !== -1 || u.indexOf('lang.css') !== -1 || /\\.css($|\\?)/.test(u);
+};
+
+const avbMorph = {
+  name: 'avb-morph',
+  resolveId(id) {
+    if (id === 'virtual:avb-morph') return '\0virtual:avb-morph';
+    return null;
+  },
+  load(id) {
+    return id === '\0virtual:avb-morph' ? ${JSON.stringify(MORPH_CLIENT)} : null;
+  },
+  // Vite reapplies a page's extracted stylesheet whenever its .astro file
+  // changes, whether or not a single character of that CSS is different. The
+  // browser treats the rewritten <style> as a new stylesheet, so every
+  // animation it defines starts over — once per keystroke while typing into a
+  // text field, which is exactly the thing this feature exists to stop. When
+  // the style blocks in the file are byte for byte what they were, the
+  // stylesheet updates are dropped and only the page patch goes out. A real
+  // CSS edit compares differently and takes Vite's own path, untouched.
+  handleHotUpdate(ctx) {
+    if (!/\\.(astro|md|mdx)$/i.test(ctx.file)) return;
+    const before = avbStyleText.get(ctx.file);
+    const now = avbStyleTextOf(avbReadFile(ctx.file));
+    avbStyleText.set(ctx.file, now);
+    if (before === undefined || before !== now) return;
+    const rest = ctx.modules.filter((m) => !avbIsStyleModule(m));
+    return rest.length === ctx.modules.length ? undefined : rest;
+  },
+  configureServer(server) {
+    const seen = new Set();
+    const channels = [server.hot, server.ws];
+    for (const env of Object.values(server.environments || {})) channels.push(env && env.hot);
+    for (const ch of channels) {
+      if (!ch || typeof ch.send !== 'function' || seen.has(ch)) continue;
+      seen.add(ch);
+      const send = ch.send.bind(ch);
+      ch.send = (...args) => {
+        const payload = args[0];
+        if (payload && payload.type === 'full-reload') {
+          return send({ type: 'custom', event: 'avb:page-changed' });
+        }
+        return send(...args);
+      };
+    }
+  },
+};
+
+const AVB_MORPH_TAG = ${JSON.stringify(MORPH_TAG_HTML)};
+
 const avbMarkers = {
   name: 'avb-node-markers',
   enforce: 'pre',
@@ -1925,15 +3474,15 @@ const avbMarkers = {
     const query = qi === -1 ? '' : id.slice(qi + 1);
     // A <Fragment set:html={x} /> renders from an imported HTML string, so
     // the page's own markers can't reach inside it. serializePageMarked tags
-    // the ?raw import with the Fragment's path; mark the chunk here so its
+    // the ?raw import with the Fragment's key; mark the chunk here so its
     // nodes outline like any other. Runs before vite:asset's own ?raw load.
     if (query) {
-      const m = /(?:^|&)avb=([\\d.]+)/.exec(query);
+      const m = /(?:^|&)avb=([^&]+)/.exec(query);
       if (!m) return null;
       try {
         const marked = markChunkHtml(
           readFileSync(file, 'utf8'),
-          m[1],
+          decodeURIComponent(m[1]),
           /(?:^|&)avbg=1(?:&|$)/.test(query)
         );
         return marked == null ? null : 'export default ' + JSON.stringify(marked) + ';';
@@ -1941,25 +3490,137 @@ const avbMarkers = {
         return null;
       }
     }
-    if (!file.endsWith('.astro') || !file.startsWith(PAGES_DIR + '/')) return null;
+    if (!file.endsWith('.astro')) return null;
+    // Pages mark with bare paths. Every other .astro under src — components
+    // and layouts — marks with its own namespace, so opening one and
+    // selecting inside it outlines on the canvas like a page does. Without
+    // this a component’s internals have no markers at all.
+    const isPage = file.startsWith(PAGES_DIR + '/');
+    if (!isPage && !file.startsWith(SRC_DIR + '/')) return null;
     try {
-      const parsed = parsePage(readFileSync(file, 'utf8'));
+      const source = readFileSync(file, 'utf8');
+      // Seeded here so the very first edit already has something to compare
+      // against, rather than spending one stylesheet rewrite learning it.
+      if (!avbStyleText.has(file)) avbStyleText.set(file, avbStyleTextOf(source));
+      const parsed = parsePage(source);
       if (!parsed.editable) return null;
       resolveChunks(parsed.model, file);
-      return serializePageMarked(parsed.model);
+      // Project-relative, matching what the app derives from the open file.
+      const rel = file.slice(PROJECT_DIR.length + 1);
+      const marked = isPage
+        ? serializePageMarked(parsed.model)
+        : serializePageMarked(parsed.model, rel + '|');
+      return isPage ? marked + AVB_CLEANUP + AVB_MORPH_TAG : marked;
     } catch {
       return null;
     }
   },
 };
 
+// Markdown can't use the load hook above: Astro's own \`astro:markdown\` plugin
+// is enforce:'pre', owns load for .md, and reads the file off disk itself — so
+// there is nothing to intercept. The document AST is the hook it does hand out,
+// and it's the right place anyway.
+//
+// One marker pair per ROOT node, numbered to match that block's index in the
+// app's tree. Frontmatter isn't in the tree so it isn't counted; an MDX import
+// is (the app keeps it as a node) but isn't wrapped, because a template in the
+// middle of the import block would be rendered content.
+const AVB_BLOCK_TYPES = [
+  'paragraph', 'heading', 'thematicBreak', 'blockquote', 'list', 'html', 'code',
+  'definition', 'footnoteDefinition', 'table', 'math', 'containerDirective',
+  'leafDirective', 'mdxJsxFlowElement', 'mdxFlowExpression',
+];
+const avbSatteriMarkers = () => {
+  const plugin = { name: 'avb-node-markers' };
+  const visit = (node, ctx) => {
+    const parent = ctx.parent(node);
+    if (!parent || parent.type !== 'root') return;
+    const raw = ctx.indexOf(node);
+    if (raw == null) return;
+    // Frontmatter is a root child here but not a node in the app's tree, so
+    // everything after it would be numbered one too high.
+    const children = parent.children || [];
+    let offset = 0;
+    for (let i = 0; i < raw && i < children.length; i++) {
+      if (children[i] && (children[i].type === 'yaml' || children[i].type === 'toml')) offset++;
+    }
+    const path = String(raw - offset);
+    ctx.insertBefore(node, { type: 'html', value: '<template data-avb-s="' + path + '"></template>' });
+    ctx.insertAfter(node, { type: 'html', value: '<template data-avb-e="' + path + '"></template>' });
+  };
+  for (const type of AVB_BLOCK_TYPES) plugin[type] = visit;
+  return plugin;
+};
+
+// Only when the project is on the processor Astro ships by default, and only
+// when it hasn't chosen its own. \`markdown.remarkPlugins\` is NOT a safe
+// fallback: on Astro 7 it needs @astrojs/markdown-remark installed, and setting
+// it without that fails config validation — the dev server wouldn't start at
+// all. A project this can't reach simply gets no markdown outlines; editing
+// through the navigator is unaffected.
+let avbMarkdownProcessor = null;
+try {
+  const { satteri } = await import('@astrojs/markdown-satteri');
+  avbMarkdownProcessor = satteri({ mdastPlugins: [avbSatteriMarkers] });
+} catch {
+  /* different Astro, different processor — skip the markers */
+}
+
 // Isolated component previews for the palette hover cards.
 const avbPreviewRoute = {
   name: 'avb-preview-route',
   hooks: {
+    // The app builds canvas URLs from page file paths, and \`trailingSlash\`
+    // decides whether this server answers /de/hotel or /de/hotel/. Hand back
+    // the resolved value — it has been through Astro's defaults, and it holds
+    // however the project arrived at it, literal or not.
+    'astro:config:done': ({ config }) => {
+      try {
+        writeFileSync(
+          new URL('./resolved.json', import.meta.url),
+          JSON.stringify({ trailingSlash: config.trailingSlash, base: config.base })
+        );
+      } catch {
+        /* the app falls back to reading the config's text */
+      }
+    },
+    // Every route this project will serve, as Astro resolved it — the files
+    // under src/pages AND anything an integration injected. A site whose pages
+    // come from a package has nothing on disk for the app to find (issue #7),
+    // and this list is the only place they exist. Written beside resolved.json
+    // rather than served: the app already reads that directory, and a file
+    // needs no route of its own to fetch it through.
+    'astro:routes:resolved': ({ routes }) => {
+      try {
+        writeFileSync(
+          new URL('./routes.json', import.meta.url),
+          JSON.stringify(
+            (routes || [])
+              .filter((r) => r && r.pattern && !String(r.pattern).startsWith('/__avb'))
+              .map((r) => ({
+                pattern: r.pattern,
+                // 'project' is a file under src/pages, 'external' came from an
+                // integration, 'internal' is Astro's own (404, and friends).
+                origin: r.origin || null,
+                entrypoint: r.entrypoint || null,
+                params: r.params || [],
+              }))
+          )
+        );
+      } catch {
+        /* an Astro without this hook simply never calls it */
+      }
+    },
     'astro:config:setup': ({ injectRoute }) => {
       injectRoute({ pattern: '/__avb/preview', entrypoint: ${JSON.stringify(
         toPosix(path.join(dir, 'preview.astro'))
+      )} });
+      injectRoute({ pattern: '/__avb/paths', entrypoint: ${JSON.stringify(
+        toPosix(path.join(dir, 'paths.js'))
+      )} });
+      injectRoute({ pattern: '/__avb/data', entrypoint: ${JSON.stringify(
+        toPosix(path.join(dir, 'data.js'))
       )} });
     },
   },
@@ -1972,28 +3633,59 @@ export default {
   // and it would sit on top of component thumbnails. Only this app's dev
   // server is affected — the project's own \`astro dev\` is untouched.
   devToolbar: { enabled: false },
+  // Astro compresses HTML by default, and the marker <template>s above turn a
+  // text node's boundary whitespace into whitespace between elements — which
+  // the compressor is free to drop. "Be <Rotator />" then renders as
+  // "BeFOUND." on the canvas while the real build keeps the space. Off here
+  // so the canvas shows the spacing the source actually has; the project's
+  // own dev server and build keep whatever it configured.
+  compressHTML: false,
   integrations: [...(base.integrations || []), avbPreviewRoute],
+  markdown: {
+    ...(base.markdown || {}),
+    ...(avbMarkdownProcessor && !(base.markdown && base.markdown.processor)
+      ? { processor: avbMarkdownProcessor }
+      : {}),
+  },
   vite: {
     ...(base.vite || {}),
-    plugins: [avbMarkers, ...((base.vite && base.vite.plugins) || [])],
+    plugins: [avbMarkers, avbMorph, ...((base.vite && base.vite.plugins) || [])],
   },
 };
 `;
     const cfgPath = path.join(dir, 'astro.config.mjs');
     fs.writeFileSync(cfgPath, cfg);
     fs.writeFileSync(path.join(dir, 'preview.astro'), PREVIEW_PAGE);
+    fs.writeFileSync(path.join(dir, 'paths.js'), PATHS_ENDPOINT);
+    fs.writeFileSync(path.join(dir, 'data.js'), DATA_ENDPOINT);
+    // This file is assembled here and handed to Astro as its config. If it
+    // will not parse, Astro does not start, and the project gets no preview at
+    // all — the editor's own canvas broken by the editor's own scaffolding,
+    // over something the project never asked for. Read it back the way node
+    // will and say no rather than hand over something that cannot load: the
+    // caller falls back to a plain dev server, which costs the outlines and
+    // the live patching and keeps everything else working.
+    if (!parsesAsModule(cfgPath)) {
+      pushDevLog(
+        '\n[stacki] the generated preview config did not parse; starting the dev ' +
+          'server without it. Outlines and live updates are off for this session.\n'
+      );
+      return null;
+    }
     return cfgPath;
   } catch {
     return null; // preview still works, just without outlines
   }
 }
 
-async function spawnDevServer(projectPath, localBin, force) {
+async function spawnDevServer(projectPath, localBin, force, bare) {
   const port = await findFreePort(4321);
   const args = ['dev', '--port', String(port), '--host', '127.0.0.1'];
   // Astro resolves --config against the project root and rejects absolute
   // paths ([ConfigNotFound]), so pass it relative to the spawn cwd.
-  const markerCfg = writeMarkerConfig(projectPath);
+  // `bare` is the last resort: the project's own config, none of this app's,
+  // so a preview still comes up even if what this app generates cannot run.
+  const markerCfg = bare ? null : writeMarkerConfig(projectPath);
   if (markerCfg) args.push('--config', toPosix(path.relative(projectPath, markerCfg)));
   if (force) args.push('--force');
 
@@ -2092,10 +3784,23 @@ function readAstroLock(projectPath) {
 let devStartInFlight = null;
 
 ipcMain.handle('dev:start', (_e, projectPath) => {
+  // Whatever thumbnails were queued for the start screen, this takes priority.
+  captureEra++;
   if (devStartInFlight) return devStartInFlight;
-  devStartInFlight = doDevStart(projectPath).finally(() => {
-    devStartInFlight = null;
-  });
+  devStartInFlight = doDevStart(projectPath)
+    // Now that a server has resolved the config, this is the authoritative
+    // answer — the scan before it could only read the config's text.
+    .then((r) => ({ ...r, trailingSlash: readTrailingSlash(projectPath) }))
+    .then((r) => {
+      // The server that just came up can also take the project's picture. A
+      // few seconds in, so it does not compete with the canvas's own first
+      // load for the same server.
+      scheduleThumb(projectPath, 6000);
+      return r;
+    })
+    .finally(() => {
+      devStartInFlight = null;
+    });
   return devStartInFlight;
 });
 
@@ -2160,7 +3865,23 @@ async function doDevStart(projectPath) {
       await new Promise((r) => setTimeout(r, 800));
     }
   }
-  throw lastErr;
+  // Everything above ran with this app's generated config. A project whose
+  // preview will not come up is worse than one without outlines, so try once
+  // more on the project's own config before giving up. What starts here has no
+  // markers and no live patching — an edit reloads the page, the way it did
+  // before any of this — but the canvas is a canvas again.
+  try {
+    const url = await spawnDevServer(projectPath, localBin, true, true);
+    pushDevLog(
+      '\n[stacki] the preview would not start with this app\'s config, so it is ' +
+        'running on the project\'s own. Outlines and live updates are off; the ' +
+        'log above says why.\n'
+    );
+    if (devServer) devServer.bare = true;
+    return { url, bare: true };
+  } catch {
+    throw lastErr; // report the first failure: it is the one that explains it
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2226,6 +3947,55 @@ ipcMain.handle('style:listFiles', async (_e, projectPath) => {
   return { files: listCssFiles(projectPath) };
 });
 
+// A component's `<style is:global>` is page CSS. Astro leaves those rules
+// unhashed, so they style whatever the page renders — including elements that
+// live in a different file from the one being edited, which is exactly the case
+// the style panel used to be blind to. Scoped `<style>` blocks are deliberately
+// left out: Astro hashes them to their own component's elements, so their rules
+// can't reach a selection made from another file.
+const ASTRO_GLOBAL_STYLE = /<style\b[^>]*\bis:global\b[^>]*>/i;
+const ASTRO_SCAN_LIMIT = 512 * 1024; // a .astro file this big isn't a component
+
+function listAstroStyleFiles(root) {
+  const out = [];
+  const walk = (dir, rel) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const full = path.join(dir, entry.name);
+      const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (CSS_SKIP_DIRS.has(entry.name)) continue;
+        walk(full, relPath);
+        continue;
+      }
+      if (!/\.astro$/i.test(entry.name)) continue;
+      try {
+        const { size } = fs.statSync(full);
+        if (size > ASTRO_SCAN_LIMIT) continue;
+        if (!ASTRO_GLOBAL_STYLE.test(fs.readFileSync(full, 'utf8'))) continue;
+        out.push({ rel: toPosix(relPath), name: entry.name, path: full, size });
+      } catch {
+        /* unreadable — nothing to offer for it */
+      }
+    }
+  };
+  // Only src/: components elsewhere aren't part of the page's CSS, and this
+  // keeps the scan off node_modules and build output entirely.
+  walk(path.join(root, 'src'), 'src');
+  return out.sort((a, b) => a.rel.localeCompare(b.rel));
+}
+
+ipcMain.handle('style:listAstroStyles', async (_e, projectPath) => {
+  if (!projectPath) return { files: [] };
+  return { files: listAstroStyleFiles(projectPath) };
+});
+
 ipcMain.handle('style:readFile', async (_e, filePath) => {
   const abs = assertInProject(filePath);
   return { css: fs.readFileSync(abs, 'utf8') };
@@ -2235,6 +4005,206 @@ ipcMain.handle('style:writeFile', async (_e, { filePath, css }) => {
   const abs = assertInProject(filePath);
   markSelfWrite(abs); // the watcher must not treat our own write as external
   fs.writeFileSync(abs, css, 'utf8');
+  return { ok: true };
+});
+
+// ---------------------------------------------------------------------------
+// Source files behind a symbol
+// ---------------------------------------------------------------------------
+
+// tsconfig/jsconfig `paths` for the open project, as [prefix, [targets]] with
+// the trailing /* stripped. Astro's own config is extended, not read: only the
+// project's aliases matter here, and those live in its own file.
+function projectAliases(projectPath) {
+  for (const name of ['tsconfig.json', 'jsconfig.json']) {
+    const file = path.join(projectPath, name);
+    if (!fs.existsSync(file)) continue;
+    try {
+      // Config files allow comments and trailing commas; strip both rather
+      // than pulling in a JSON5 parser for one field.
+      const raw = fs
+        .readFileSync(file, 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/(^|[^:])\/\/.*$/gm, '$1')
+        .replace(/,(\s*[}\]])/g, '$1');
+      const json = JSON.parse(raw);
+      const paths = json?.compilerOptions?.paths;
+      if (!paths) continue;
+      return Object.entries(paths).map(([k, v]) => [
+        k.replace(/\*$/, ''),
+        (Array.isArray(v) ? v : [v]).map((t) => String(t).replace(/\*$/, '')),
+      ]);
+    } catch {
+      // A malformed config just means no aliases.
+    }
+  }
+  return [];
+}
+
+const SRC_EXTS = ['', '.ts', '.js', '.mjs', '.mts', '.tsx', '.jsx', '.json', '.astro'];
+
+function firstExisting(base) {
+  for (const ext of SRC_EXTS) {
+    const p = base + ext;
+    if (fs.existsSync(p) && fs.statSync(p).isFile()) return p;
+  }
+  for (const ext of SRC_EXTS.slice(1)) {
+    const p = path.join(base, 'index' + ext);
+    if (fs.existsSync(p) && fs.statSync(p).isFile()) return p;
+  }
+  return null;
+}
+
+// The file an import specifier points at: relative paths, project aliases
+// (`@/consts.ts`), and the usual extension guessing. Bare package names
+// resolve to nothing — node_modules isn't the user's code to edit.
+function resolveImportPath(projectPath, fromFile, spec) {
+  const s = String(spec || '');
+  if (!s) return null;
+  if (s.startsWith('.')) {
+    return firstExisting(path.resolve(path.dirname(fromFile), s));
+  }
+  for (const [prefix, targets] of projectAliases(projectPath)) {
+    if (!prefix || !s.startsWith(prefix)) continue;
+    const rest = s.slice(prefix.length);
+    for (const target of targets) {
+      const found = firstExisting(path.resolve(projectPath, target, rest));
+      if (found) return found;
+    }
+  }
+  if (s.startsWith('/')) return firstExisting(path.join(projectPath, s.slice(1)));
+  return null;
+}
+
+// 1-based line of `name`'s top-level declaration, so the editor can open on it.
+function declarationLine(text, name) {
+  if (!name) return 0;
+  const re = new RegExp(
+    // `[ \t]*`, not `\s*`: with the m flag `\s` eats the newlines before the
+    // declaration, and the match would start on a blank line above it.
+    `^[ \\t]*(?:export\\s+)?(?:const|let|var|function|class)\\s+${String(name).replace(/[^\w$]/g, '')}\\b`,
+    'm'
+  );
+  const m = re.exec(text);
+  if (!m) return 0;
+  return text.slice(0, m.index).split('\n').length;
+}
+
+// Opens the file an imported symbol comes from. `fromFile` is the file doing
+// the importing, so relative specifiers resolve the way the bundler sees them.
+ipcMain.handle('src:readSymbol', async (_e, { projectPath, fromFile, spec, name }) => {
+  if (!projectPath || !fromFile) return { ok: false };
+  const abs = resolveImportPath(projectPath, path.resolve(fromFile), spec);
+  if (!abs) return { ok: false, reason: 'not-found' };
+  assertInProject(abs);
+  const stat = fs.statSync(abs);
+  if (stat.size > MAX_EDITABLE_BYTES) return { ok: false, reason: 'too-large' };
+  const text = fs.readFileSync(abs, 'utf8');
+  return {
+    ok: true,
+    rel: path.relative(projectPath, abs),
+    text,
+    line: declarationLine(text, name),
+  };
+});
+
+// Where an import points, as a project-relative path. Same resolution as
+// src:readSymbol, but it never reads the file — the callers here are asking
+// about images, and their bytes are none of this channel's business.
+ipcMain.handle('src:resolvePath', async (_e, { projectPath, fromFile, spec }) => {
+  if (!projectPath || !fromFile) return { ok: false };
+  const abs = resolveImportPath(projectPath, path.resolve(fromFile), spec);
+  if (!abs) return { ok: false };
+  assertInProject(abs);
+  return { ok: true, rel: toPosix(path.relative(projectPath, abs)) };
+});
+
+// An image's pixel size, read from the file's own header.
+//
+// Astro takes the intrinsic size straight from a local asset — only a remote
+// source gets `inferSize`. So a width/height field over a project file should
+// say what that size IS, and to do that the app has to know it without waiting
+// for a thumbnail somewhere to finish decoding.
+function imageSizeOf(abs) {
+  let fd;
+  try {
+    fd = fs.openSync(abs, 'r');
+    const head = Buffer.alloc(32768);
+    const read = fs.readSync(fd, head, 0, head.length, 0);
+    const buf = head.subarray(0, read);
+
+    // PNG: IHDR is always the first chunk.
+    if (buf.length > 24 && buf.toString('binary', 1, 4) === 'PNG') {
+      return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+    }
+    // GIF: little-endian in the logical screen descriptor.
+    if (buf.length > 10 && buf.toString('binary', 0, 3) === 'GIF') {
+      return { w: buf.readUInt16LE(6), h: buf.readUInt16LE(8) };
+    }
+    // WebP: VP8 (lossy), VP8L (lossless) and VP8X (extended) each differ.
+    if (buf.length > 30 && buf.toString('binary', 0, 4) === 'RIFF' && buf.toString('binary', 8, 12) === 'WEBP') {
+      const kind = buf.toString('binary', 12, 16);
+      if (kind === 'VP8 ') return { w: buf.readUInt16LE(26) & 0x3fff, h: buf.readUInt16LE(28) & 0x3fff };
+      if (kind === 'VP8L') {
+        const bits = buf.readUInt32LE(21);
+        return { w: (bits & 0x3fff) + 1, h: ((bits >> 14) & 0x3fff) + 1 };
+      }
+      if (kind === 'VP8X') {
+        const w = 1 + (buf[24] | (buf[25] << 8) | (buf[26] << 16));
+        const h = 1 + (buf[27] | (buf[28] << 8) | (buf[29] << 16));
+        return { w, h };
+      }
+    }
+    // JPEG: walk the segments to the start-of-frame, which carries the size.
+    if (buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+      let at = 2;
+      while (at + 9 < buf.length) {
+        if (buf[at] !== 0xff) { at += 1; continue; }
+        const marker = buf[at + 1];
+        const len = buf.readUInt16BE(at + 2);
+        // SOF0…SOF15, minus the four that aren't frame headers.
+        if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc, 0xd8].includes(marker)) {
+          return { h: buf.readUInt16BE(at + 5), w: buf.readUInt16BE(at + 7) };
+        }
+        at += 2 + len;
+      }
+    }
+    // SVG: width/height when they're absolute, else the viewBox's own units.
+    if (/\.svg$/i.test(abs)) {
+      const text = buf.toString('utf8');
+      const tag = text.match(/<svg\b[^>]*>/i)?.[0] || '';
+      const num = (name) => {
+        const raw = tag.match(new RegExp(`\\b${name}\\s*=\\s*["']([^"']+)["']`, 'i'))?.[1];
+        return raw && /^[\d.]+(px)?$/i.test(raw.trim()) ? Math.round(parseFloat(raw)) : null;
+      };
+      const w = num('width');
+      const h = num('height');
+      if (w && h) return { w, h };
+      const box = tag.match(/\bviewBox\s*=\s*["']\s*[-\d.]+\s+[-\d.]+\s+([\d.]+)\s+([\d.]+)/i);
+      if (box) return { w: Math.round(parseFloat(box[1])), h: Math.round(parseFloat(box[2])) };
+    }
+  } catch {
+    /* unreadable or a format we don't decode — the caller falls back */
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* already gone */ }
+  }
+  return null;
+}
+
+ipcMain.handle('assets:dimensions', async (_e, { projectPath, rel }) => {
+  const abs = assertInProject(path.resolve(projectPath, rel));
+  return { dims: imageSizeOf(abs) };
+});
+
+ipcMain.handle('src:readText', async (_e, { projectPath, rel }) => {
+  const abs = assertInProject(path.resolve(projectPath, rel));
+  return { text: fs.readFileSync(abs, 'utf8') };
+});
+
+ipcMain.handle('src:writeText', async (_e, { projectPath, rel, text }) => {
+  const abs = assertInProject(path.resolve(projectPath, rel));
+  markSelfWrite(abs);
+  fs.writeFileSync(abs, text, 'utf8');
   return { ok: true };
 });
 
@@ -2289,6 +4259,8 @@ function nodeVersionOf(bin) {
   }
 }
 
+ipcMain.handle('dev:probe', (_e, url) => probeUrl(url));
+
 ipcMain.handle('dev:diagnose', async (_e, projectPath) => {
   const nodePath = resolveNodeBin();
   const nodeVersion = nodePath ? nodeVersionOf(nodePath) : null;
@@ -2326,17 +4298,70 @@ ipcMain.handle('git:info', async (_e, projectPath) => {
   } catch {
     return { isRepo: false };
   }
-  const info = { isRepo: true, branch: '', branches: [], remote: null, dirty: false, ahead: 0 };
+  const info = {
+    isRepo: true,
+    branch: '',
+    branches: [],
+    remote: null,
+    dirty: false,
+    ahead: 0,
+    // Branches holding work that was left behind on the way out, so the
+    // switcher can say where it is rather than making it a thing you have to
+    // remember.
+    parked: [],
+  };
+  try {
+    const { stdout } = await git(projectPath, ['stash', 'list', '--format=%gs']);
+    const tag = /stacki:park:(.+)$/;
+    info.parked = [
+      ...new Set(
+        stdout
+          .split('\n')
+          .map((l) => (l.match(tag) || [])[1])
+          .filter(Boolean)
+          .map((b) => b.trim())
+      ),
+    ];
+  } catch {
+    /* no stashes, or not a repo yet */
+  }
   try {
     info.branch = (await git(projectPath, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim();
   } catch {
     info.branch = '(no commits yet)';
   }
   try {
-    info.branches = (await git(projectPath, ['branch', '--format=%(refname:short)'])).stdout
+    // What HEAD actually points at. The history panel reloads when this moves,
+    // which is how a commit made from the chip shows up in the timeline
+    // without the panel having to know the chip exists.
+    info.head = (await git(projectPath, ['rev-parse', 'HEAD'])).stdout.trim();
+  } catch {
+    info.head = null; // no commits yet
+  }
+  try {
+    // Whose commits are "yours". Git records an author on every commit, and on
+    // your own machine that is nearly always you — "Timothy Ricks changed the
+    // hero" reads oddly about yourself.
+    info.userEmail = (await git(projectPath, ['config', 'user.email'])).stdout.trim() || null;
+  } catch {
+    info.userEmail = null;
+  }
+  try {
+    const listed = (await git(projectPath, ['branch', '--format=%(refname:short)'])).stdout
       .split('\n')
       .map((s) => s.trim())
       .filter(Boolean);
+    // Git lists branches alphabetically, which puts the trunk wherever its
+    // name happens to fall. But the trunk is not one branch among many — it
+    // is the one you came from and the one you go back to, so it goes first
+    // and the rest keep the order git gave them.
+    const trunk = ['main', 'master'].find((b) => listed.includes(b));
+    info.branches = trunk ? [trunk, ...listed.filter((b) => b !== trunk)] : listed;
+    // Named as well as ordered. Git will delete the trunk as readily as any
+    // other branch — `git branch -d main` succeeds the moment main is merged
+    // into whatever you are standing on — and the branch everything comes back
+    // to is not one to lose to a stray click.
+    info.trunk = trunk || null;
   } catch {
     /* empty repo */
   }
@@ -2407,30 +4432,86 @@ ipcMain.handle('git:init', async (_e, projectPath) => {
   return { ok: true };
 });
 
-ipcMain.handle('git:checkout', async (_e, { projectPath, branch, create }) => {
-  const args = create ? ['checkout', '-b', branch] : ['checkout', branch];
-  try {
-    await git(projectPath, args);
-  } catch (err) {
-    const detail = String(err.stderr || err.message || '');
-    // Git refuses to switch when the working tree would be clobbered, and
-    // leaves HEAD where it was — every later edit then lands on the branch
-    // the user thought they left. Say so plainly instead of passing the raw
-    // porcelain through.
-    if (/would be overwritten|Please commit your changes|overwritten by checkout/i.test(detail)) {
-      const files = detail
-        .split('\n')
-        .map((l) => l.trim())
-        .filter((l) => l && !/^(error|Please|Aborting|warning)/i.test(l) && !l.endsWith(':'));
-      throw new Error(
-        `Still on "${(await currentBranch(projectPath)) || 'this branch'}" — switching to "${branch}" would overwrite uncommitted changes` +
-          (files.length ? ` in ${files.slice(0, 4).join(', ')}` : '') +
-          '. Commit them first, then switch.'
-      );
-    }
-    throw new Error(detail.trim() || `Could not switch to "${branch}".`);
+// Work in progress, set aside under the branch it belongs to.
+//
+// Git will not switch branches over changes it would have to overwrite, and
+// the usual advice — commit first — asks for a commit that only exists to
+// make git cooperate. So the changes are put away against the branch being
+// left, and taken back out when that branch is next opened. They are never
+// lost and never travel to a branch they were not written on.
+//
+// The tag is what makes this safe: only a stash Stacki wrote is ever restored,
+// so someone's own `git stash` is left alone.
+const parkTag = (branch) => `stacki:park:${branch}`;
+
+async function isDirty(projectPath) {
+  const { stdout } = await git(projectPath, ['status', '--porcelain']);
+  return stdout.trim().length > 0;
+}
+
+// The most recent parking for this branch, as a ref that is still valid right
+// now — stash indices shift as entries come and go, so this is resolved
+// immediately before it is used.
+async function parkedRef(projectPath, branch) {
+  const { stdout } = await git(projectPath, ['stash', 'list', '--format=%gd%x09%gs']);
+  const tag = parkTag(branch);
+  for (const line of stdout.split('\n')) {
+    const [ref, subject] = line.split('\t');
+    if (ref && subject && subject.trim().endsWith(tag)) return ref.trim();
   }
-  return { ok: true };
+  return null;
+}
+
+async function park(projectPath, branch) {
+  if (!(await isDirty(projectPath))) return false;
+  await git(projectPath, ['stash', 'push', '--include-untracked', '-m', parkTag(branch)]);
+  return true;
+}
+
+async function unpark(projectPath, branch) {
+  const ref = await parkedRef(projectPath, branch);
+  if (!ref) return { restored: false };
+  try {
+    await git(projectPath, ['stash', 'pop', ref]);
+    return { restored: true };
+  } catch (err) {
+    // A pop that cannot apply leaves conflict markers in the files. That is a
+    // reasonable state for someone at a terminal and a bad one for an editor
+    // that will parse those files a moment later — the page would read as
+    // broken markup. The tree goes back to the branch as committed, and the
+    // work stays parked, which is the state it was already in. Safe because
+    // the switch left the tree clean, so there is nothing else here to lose.
+    try {
+      await git(projectPath, ['reset', '--hard', 'HEAD']);
+      await git(projectPath, ['clean', '-fd']);
+    } catch {
+      /* nothing better to try */
+    }
+    return {
+      restored: false,
+      error:
+        `Your work on "${branch}" is still parked — it could not be put back automatically because the branch has changed underneath it. ` +
+        'It is safe: recover it with `git stash list` and `git stash pop`.',
+    };
+  }
+}
+
+// Switching branches. The behaviour, and why it tries before it asks, is in
+// gitBranches.js; park/unpark are handed in because they live here.
+ipcMain.handle('git:checkout', async (_e, { projectPath, branch, create, parkFirst }) => {
+  const r = await switchBranch(git, {
+    projectPath,
+    branch,
+    create,
+    parkFirst,
+    park: async () => park(projectPath, await currentBranch(projectPath)),
+    unpark: (from) => unpark(projectPath, from),
+  });
+  if (!r.ok) return r;
+  // Whatever was last left on this branch comes back out, however the switch
+  // was made — that half is always wanted.
+  const back = await unpark(projectPath, branch);
+  return { ...r, parkedFrom: r.parked ? r.from : null, ...back };
 });
 
 async function currentBranch(projectPath) {
@@ -2441,10 +4522,184 @@ async function currentBranch(projectPath) {
   }
 }
 
-ipcMain.handle('git:commit', async (_e, { projectPath, message }) => {
-  await git(projectPath, ['add', '-A']);
-  await git(projectPath, ['commit', '-m', message || 'Update from Stacki']);
+// --- Previewing an old version ---------------------------------------------
+//
+// A second, deliberately dumb dev server pointed at a checkout of an old
+// commit (see previewWorktree.js). None of the primary server's machinery
+// applies: a preview is read-only, so it needs no markers, no morph client and
+// no click-to-select — it only has to render. That is `bare` on spawnDevServer,
+// which already exists as the primary server's last-resort path.
+//
+// Kept in its own registry rather than generalising `devServer`, whose daemon
+// detection, external-server adoption and log plumbing are all keyed to there
+// being exactly one.
+const previewServers = new Map(); // projectPath -> {proc, url, ref, port}
+
+async function stopPreview(projectPath) {
+  const cur = previewServers.get(projectPath);
+  if (!cur) return;
+  previewServers.delete(projectPath);
+  try {
+    cur.proc?.kill();
+  } catch {
+    /* already gone */
+  }
+  try {
+    await previewWorktree.removeWorktree(git, { projectPath });
+  } catch {
+    /* the checkout is disposable; nothing here is the user's work */
+  }
+}
+
+function stopAllPreviews() {
+  for (const [projectPath] of previewServers) stopPreview(projectPath);
+}
+
+ipcMain.handle('preview:atCommit', async (_e, { projectPath, ref }) => {
+  const dir = await previewWorktree.ensureWorktree(git, { projectPath, ref });
+
+  // A server already up for this project just needs the checkout moved under
+  // it — Vite notices the files changed and reloads, which is far quicker than
+  // starting Astro again for every commit somebody clicks.
+  const running = previewServers.get(projectPath);
+  if (running?.proc && !running.proc.killed) {
+    running.ref = ref;
+    return { url: running.url, ref, reused: true };
+  }
+
+  const bin = isWin ? 'astro.cmd' : 'astro';
+  const localBin = path.join(projectPath, 'node_modules', '.bin', bin);
+  if (!fs.existsSync(localBin)) {
+    throw new Error(
+      'This project’s packages aren’t installed, so an older version can’t be shown. Install them and try again.'
+    );
+  }
+  const port = await findFreePort(4500);
+  const [cmd, argv] = nodeCliCommand(localBin, [
+    'dev',
+    '--port',
+    String(port),
+    '--host',
+    '127.0.0.1',
+  ]);
+  const proc = spawn(cmd, argv, {
+    cwd: dir,
+    shell: isWin && cmd === localBin,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+  });
+  const url = `http://127.0.0.1:${port}`;
+  let log = '';
+  proc.stdout.on('data', (d) => (log += d.toString()));
+  proc.stderr.on('data', (d) => (log += d.toString()));
+  previewServers.set(projectPath, { proc, url, ref, port });
+  proc.on('exit', () => {
+    if (previewServers.get(projectPath)?.proc === proc) previewServers.delete(projectPath);
+  });
+
+  // Wait for it to answer rather than guessing at a delay. An old commit can
+  // need packages that are not installed now, and that shows up as a server
+  // that never comes up — so the failure has to be caught here and explained,
+  // not left as a blank canvas.
+  const deadline = Date.now() + 45000;
+  while (Date.now() < deadline) {
+    if (proc.exitCode !== null || proc.killed) break;
+    if (await serverAlive(url)) return { url, ref, reused: false };
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  await stopPreview(projectPath);
+  // The commonest real cause, said in those terms rather than as a stack trace.
+  const missing = /Cannot find (?:module|package) ['"]?([^'"\s]+)/i.exec(log);
+  throw new Error(
+    missing
+      ? `That version needs ${missing[1]}, which isn’t installed here. It can’t be shown without it.`
+      : 'That version wouldn’t start. It may need packages that aren’t installed any more.'
+  );
+});
+
+ipcMain.handle('preview:stop', async (_e, { projectPath }) => {
+  await stopPreview(projectPath);
   return { ok: true };
+});
+
+// --- Reading history -------------------------------------------------------
+//
+// The panel gets files already described (see describeFile): "Home" rather
+// than "src/pages/index.astro". Done here rather than in the renderer because
+// this is the side that knows the project's shape, and because it keeps the
+// panel about drawing rather than about interpreting paths.
+
+ipcMain.handle('git:log', async (_e, { projectPath, ref, limit, skip }) =>
+  gitHistory.log(git, { projectPath, ref, limit, skip })
+);
+
+ipcMain.handle('git:commitFiles', async (_e, { projectPath, ref }) =>
+  gitHistory.describeFiles(await gitHistory.commitFiles(git, { projectPath, ref }))
+);
+
+// Every file in the project, with what has happened to each — the file
+// browser's list, and the same status the commit picker reads.
+ipcMain.handle('git:allFiles', async (_e, { projectPath }) =>
+  gitHistory.describeFiles(await gitHistory.allFiles(git, { projectPath }))
+);
+
+ipcMain.handle('git:status', async (_e, { projectPath }) =>
+  gitHistory.describeFiles(await gitHistory.status(git, { projectPath }))
+);
+
+ipcMain.handle('git:fileAt', async (_e, { projectPath, ref, path: filePath }) =>
+  gitHistory.fileAt(git, { projectPath, ref, path: filePath })
+);
+
+ipcMain.handle('git:worktrees', async (_e, { projectPath }) =>
+  gitHistory.worktrees(git, { projectPath })
+);
+
+// Setting work aside and picking it back up, on their own. The switch has done
+// this internally for a while; a merge that finds unsaved work in its way needs
+// the same two steps, and the user is the one deciding to take them.
+ipcMain.handle('git:park', async (_e, { projectPath }) => {
+  const branch = await currentBranch(projectPath);
+  const parked = await park(projectPath, branch);
+  return { ok: true, parked, branch };
+});
+
+ipcMain.handle('git:unpark', async (_e, { projectPath }) => {
+  const branch = await currentBranch(projectPath);
+  return unpark(projectPath, branch);
+});
+
+ipcMain.handle('git:merge', async (_e, { projectPath, branch }) =>
+  mergeBranch(git, { projectPath, branch })
+);
+
+// Finishing a merge the user has chosen their way through. The conflicting
+// files come back from git:merge with both versions; this applies the answers.
+ipcMain.handle('git:resolveMerge', async (_e, { projectPath, branch, choices }) =>
+  resolveMerge(git, { projectPath, branch, choices })
+);
+
+ipcMain.handle('git:deleteBranch', async (_e, { projectPath, branch, force }) =>
+  deleteBranch(git, { projectPath, branch, force })
+);
+
+ipcMain.handle('git:commit', async (_e, { projectPath, message, paths }) =>
+  gitSnapshot.commit(git, { projectPath, message, paths })
+);
+
+ipcMain.handle('git:restoreFile', async (_e, { projectPath, ref, path: filePath }) =>
+  gitSnapshot.restoreFile(git, { projectPath, ref, path: filePath })
+);
+
+// `park` is handed in rather than imported: it lives here, over the stash, and
+// is the reason going back to an old version cannot lose what is on disk now.
+ipcMain.handle('git:restoreProject', async (_e, { projectPath, ref }) => {
+  const branch = await currentBranch(projectPath);
+  return gitSnapshot.restoreProject(git, {
+    projectPath,
+    ref,
+    park: () => park(projectPath, branch),
+  });
 });
 
 ipcMain.handle('git:push', async (_e, { projectPath, branch }) => {

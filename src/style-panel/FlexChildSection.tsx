@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { SegBar, StackedField, LiveInput, PropLabel, GroupLabel, displayOf, type Props, type Seg } from './TypographySection'
 import { parseFlexShorthand } from './lib/webflow'
+import { splitTopLevelSpaces } from './lib/background'
+import SegmentPill from './components/SegmentPill'
 
 // The Flex Child section — the controls that apply to the selected element when it
 // is a child of a flex (or grid) container: its sizing (the `flex` shorthand), its
@@ -222,7 +224,7 @@ function SizingControl(props: Props) {
   const isPreset = FLEX_SEG_VALUES.has(current)
   // Decomposable values resolve to a `G S B` triple; a single leftover token is a whole
   // custom value (unset / var() / a keyword) that belongs in the single input.
-  const isTriple = current.split(/\s+/).length === 3
+  const isTriple = splitTopLevelSpaces(current).length === 3
   const [panelOpen, setPanelOpen] = useState(false)
   const [singleCustom, setSingleCustom] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -255,6 +257,7 @@ function SizingControl(props: Props) {
       <div className="embed-editor_size-row">
         <PropLabel label="Sizing" prop={flexProp} d={displayOf(read(flexProp))} contributors={read(flexProp)?.contributors ?? []} busy={busy} onClear={clearFlex} onProvenance={onProvenance} onSelectSelector={onSelectSelector} />
         <div ref={rootRef} className={`embed-editor_display ${showSingle ? 'is-custom' : ''}`} role="group" aria-label="Flex sizing">
+          <SegmentPill />
           {showSingle ? (
             <LiveInput
               value={current}

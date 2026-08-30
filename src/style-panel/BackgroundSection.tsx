@@ -2,18 +2,25 @@ import { useEffect, useId, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { ReactNode } from 'react'
 import FieldLabel from './components/FieldLabel'
+import { PropTip, ProvenanceLabel } from './components/PropTip'
 import SegmentedControl, { type SegmentedOption } from './components/SegmentedControl'
 import Select from './components/Select'
+import useScrub, { type ScrubHandlers } from './components/useScrub'
 import { handleArrowStep } from './lib/number-step'
 import ProvenanceList from './ProvenanceList'
 import { blankLayer, colorOverlayImage, colorOverlayOf, layerKind, layerLabel, parseLayers, serializeLayers, splitBackgroundShorthand, splitTopLevelSpaces, type BgLayer, type LayerKind } from './lib/background'
 import LayerList from './LayerList'
 import VariableConnect from './VariableConnect'
-import { parseGradient, serializeGradient } from './lib/gradient'
+import { blankGradientOf, parseGradient, serializeGradient } from './lib/gradient'
+import { requestAsset } from '../assetPick.js'
+import { assetValueFor } from '../assetPath.js'
+import { srcCandidates } from '../ui/AssetThumb.jsx'
+import { getHost } from './lib/host'
 import GradientEditor from './GradientEditor'
 import ColorSwatch from './components/ColorSwatch'
-import ImageAssetPicker from './components/ImageAssetPicker'
+import { useLiveColor } from './lib/live-color'
 import type { Contributor, ResolvedProp } from './lib/resolved'
+import { commitInPlace } from './lib/commit-in-place'
 
 // The Backgrounds section — Webflow parity. `background` is a stack of layers
 // (images + gradients) painted over a single background-color. The layer list
@@ -57,22 +64,19 @@ function parseImportant(input: string): { value: string; important: boolean } {
 
 // ─────────────────────────── Shared label ───────────────────────────
 
-function BgLabel({ label, prop, d, contributors, busy, onClear, onProvenance, onSelectSelector }: {
+function BgLabel({ label, prop, d, contributors, busy, scrubProps, onClear, onProvenance, onSelectSelector }: {
   label: string
   prop: string
   d: Display
   contributors: Contributor[]
   busy: boolean
+  scrubProps?: ScrubHandlers
   onClear: () => void
   onProvenance: (prop: string, anchor: DOMRect) => void
   onSelectSelector: (selector: string, prop?: string) => void
 }) {
   if (d.present && !d.isSelected) {
-    return (
-      <button type="button" className="embed-editor_size-label embed-editor_prop-orange" disabled={busy} title="Set through another selector — click to see all" onClick={(event) => onProvenance(prop, event.currentTarget.getBoundingClientRect())}>
-        {label}
-      </button>
-    )
+    return <ProvenanceLabel label={label} props={[prop]} busy={busy} onProvenance={onProvenance} />
   }
   return (
     <FieldLabel
@@ -81,8 +85,10 @@ function BgLabel({ label, prop, d, contributors, busy, onClear, onProvenance, on
       disabled={busy}
       onReset={onClear}
       resetLabel="Clear"
+      tooltip={<PropTip props={[prop]} />}
       title={d.overridden ? `Overridden by ${d.winnerSelector}` : undefined}
       menuNote={(close) => <ProvenanceList contributors={contributors} prop={prop} onSelect={(sel, p) => { onSelectSelector(sel, p); close() }} />}
+      scrubProps={scrubProps}
     >
       {label}
     </FieldLabel>
@@ -90,49 +96,62 @@ function BgLabel({ label, prop, d, contributors, busy, onClear, onProvenance, on
 }
 
 // A live text field bound to one property (Color, and inside the layer editor).
-function BgField({ prop, label, placeholder, prefix, read, busy, setProp, clearProp, liveSetProp, onProvenance, onSelectSelector }: {
+function BgField({ prop, label, placeholder, prefix, swatchLabel, read, busy, setProp, clearProp, liveSetProp, onProvenance, onSelectSelector }: {
   prop: string
   label: string
   placeholder: string
   prefix?: ReactNode
+  /** Render a colour swatch before the field, editing this same property. Owned
+   *  here rather than passed in as `prefix` so a drag on it shows in the field. */
+  swatchLabel?: string
 } & Props) {
   const d = displayOf(read(prop))
   const external = d.present ? (d.important ? `${d.value} !important` : d.value) : ''
   const [draft, setDraft] = useState(external)
+  const [shown, noteLive] = useLiveColor(draft)
   const focused = useRef(false)
   const liveTimer = useRef<number | null>(null)
 
   useEffect(() => { if (!focused.current) setDraft(external) }, [external])
   const cancelLive = () => { if (liveTimer.current != null) { window.clearTimeout(liveTimer.current); liveTimer.current = null } }
   useEffect(() => cancelLive, [])
+  // Undelayed live write for the scrub, which throttles its own — see useScrub.
+  const liveNow = (text: string) => {
+    const trimmed = text.trim()
+    if (!trimmed) return
+    const parsed = parseImportant(trimmed)
+    liveSetProp(prop, parsed.value, parsed.important)
+  }
   const scheduleLive = (text: string) => {
     cancelLive()
-    liveTimer.current = window.setTimeout(() => {
-      liveTimer.current = null
-      const trimmed = text.trim()
-      if (!trimmed) return
-      const parsed = parseImportant(trimmed)
-      liveSetProp(prop, parsed.value, parsed.important)
-    }, 100)
+    liveTimer.current = window.setTimeout(() => { liveTimer.current = null; liveNow(text) }, 100)
   }
-  const commit = () => {
-    const trimmed = draft.trim()
+  const commit = (text = draft) => {
+    const trimmed = text.trim()
     if (!trimmed) { clearProp(prop); return }
     const parsed = parseImportant(trimmed)
     setProp(prop, parsed.value, parsed.important)
   }
+  const scrub = useScrub({
+    value: draft,
+    disabled: busy,
+    onPreview: setDraft,
+    onInput: liveNow,
+    onCommit: (text) => { setDraft(text); commit(text) },
+  })
 
   const input = (
-    <VariableConnect ariaLabel={`Connect ${label} to a variable`} disabled={busy} prop={prop} onPick={(binding) => setProp(prop, binding, false)}>
+    <VariableConnect code ariaLabel={`Connect ${label} to a variable`} disabled={busy} prop={prop} onPick={(binding) => setProp(prop, binding, false)}>
     <input
+      {...scrub.input}
       className="u-input embed-editor_size-input"
       data-prop={prop}
-      value={draft}
-      onChange={(event) => { setDraft(event.target.value); scheduleLive(event.target.value) }}
+      value={shown}
+      onChange={(event) => { noteLive(null); setDraft(event.target.value); scheduleLive(event.target.value) }}
       onFocus={() => { focused.current = true }}
       onBlur={() => { focused.current = false; cancelLive(); commit() }}
       onKeyDown={(event) => {
-        if (event.key === 'Enter') { event.currentTarget.blur(); return }
+        if (event.key === 'Enter') { commitInPlace(event.currentTarget); return }
         const stepped = handleArrowStep(event)
         if (!stepped) return
         event.preventDefault()
@@ -150,10 +169,27 @@ function BgField({ prop, label, placeholder, prefix, read, busy, setProp, clearP
     </VariableConnect>
   )
 
+  const swatch = swatchLabel ? (
+    <ColorSwatch
+      value={shown}
+      busy={busy}
+      ariaLabel={swatchLabel}
+      onChange={(color, live) => {
+        // Show the drag in the field as it happens; the model only hears about it
+        // when the drag ends, and only then is `shown` handed back to it.
+        noteLive(live ? color : null)
+        if (live) { liveSetProp(prop, color, false); return }
+        setDraft(color)
+        setProp(prop, color, false)
+      }}
+    />
+  ) : null
+  const before = swatch ?? prefix
+
   return (
     <>
-      <BgLabel label={label} prop={prop} d={d} contributors={read(prop)?.contributors ?? []} busy={busy} onClear={() => clearProp(prop)} onProvenance={onProvenance} onSelectSelector={onSelectSelector} />
-      {prefix ? <div className="embed-editor_bg-inline">{prefix}{input}</div> : input}
+      <BgLabel label={label} prop={prop} d={d} contributors={read(prop)?.contributors ?? []} busy={busy} scrubProps={scrub.label} onClear={() => clearProp(prop)} onProvenance={onProvenance} onSelectSelector={onSelectSelector} />
+      {before ? <div className="embed-editor_bg-inline">{before}{input}</div> : input}
     </>
   )
 }
@@ -212,23 +248,31 @@ function LayerLonghandField({ layers, index, field, prop, label, placeholder, bu
     const next = layers.map((l, i) => (i === index ? { ...l, [field]: text } : l))
     return serializeLayers(next)[field === 'image' ? 'image' : field] as string
   }
-  const commit = (live: boolean) => {
-    const value = listFor(draft.trim())
+  const commit = (live: boolean, text = draft) => {
+    const value = listFor(text.trim())
     if (live) { if (value) liveSetProp(prop, value, false); return }
     if (value) setProp(prop, value, false)
     else clearProp(prop)
   }
+  const scrub = useScrub({
+    value: draft,
+    disabled: busy,
+    onPreview: setDraft,
+    onInput: (text) => commit(true, text),
+    onCommit: (text) => { setDraft(text); commit(false, text) },
+  })
 
   return (
-    <VariableConnect ariaLabel={`Connect ${label} to a variable`} disabled={busy} prop={prop} onPick={(binding) => setProp(prop, binding, false)}>
+    <VariableConnect code ariaLabel={`Connect ${label} to a variable`} disabled={busy} prop={prop} onPick={(binding) => setProp(prop, binding, false)}>
     <input
+      {...scrub.input}
       className="u-input embed-editor_size-input"
       value={draft}
-      onChange={(event) => { setDraft(event.target.value); commit(true) }}
+      onChange={(event) => { setDraft(event.target.value); commit(true, event.target.value) }}
       onFocus={() => { focused.current = true }}
       onBlur={() => { focused.current = false; commit(false) }}
       onKeyDown={(event) => {
-        if (event.key === 'Enter') { event.currentTarget.blur(); return }
+        if (event.key === 'Enter') { commitInPlace(event.currentTarget); return }
         const stepped = handleArrowStep(event)
         if (!stepped) return
         event.preventDefault()
@@ -312,8 +356,16 @@ function BgPartInput({ value, placeholder, label, busy, disabled, onLive, onComm
   const [draft, setDraft] = useState(value)
   const focused = useRef(false)
   useEffect(() => { if (!focused.current) setDraft(value) }, [value])
+  const scrub = useScrub({
+    value: draft,
+    disabled: busy || disabled,
+    onPreview: setDraft,
+    onInput: (text) => onLive(text.trim()),
+    onCommit: (text) => { setDraft(text); onCommit(text.trim()) },
+  })
   return (
     <input
+      {...scrub.input}
       className={`u-input embed-editor_size-input ${disabled ? 'is-inactive' : ''}`}
       value={draft}
       placeholder={placeholder}
@@ -324,7 +376,7 @@ function BgPartInput({ value, placeholder, label, busy, disabled, onLive, onComm
       onFocus={() => { focused.current = true }}
       onBlur={() => { focused.current = false; onCommit(draft.trim()) }}
       onKeyDown={(e) => {
-        if (e.key === 'Enter') { e.currentTarget.blur(); return }
+        if (e.key === 'Enter') { commitInPlace(e.currentTarget); return }
         const stepped = handleArrowStep(e)
         if (!stepped) return
         e.preventDefault()
@@ -461,32 +513,91 @@ function imageUrlOf(image: string): string | null {
   const m = image.match(/url\(\s*['"]?([^'")]+?)['"]?\s*\)/i)
   return m ? m[1] : null
 }
+
+// Where on disk a CSS url points.
+//
+// A background's url is written for the SITE — `/lumos-background.svg` is
+// served out of public/ by the dev server. The style panel is not the site: it
+// runs in the app's own window, on the app's own origin, where that path is a
+// 404 and every preview came up empty.
+//
+// The path is worked out rather than looked up. There is no list of the
+// project's assets in the style panel (`host.files` is the STYLESHEETS), and
+// fetching one would make a thumbnail wait on a round trip. A root-relative
+// url is public/ or it is the project root, so both are offered and the img
+// falls through to the next when one does not load — the same fallback
+// AssetThumb already uses for its two url schemes.
+function assetSrcCandidates(url: string | null): string[] {
+  if (!url) return []
+  const clean = url.split(/[?#]/)[0]
+  // Hosted elsewhere, or inline: not a file, and shown from where it points.
+  if (/^(https?:)?\/\//.test(clean) || clean.startsWith('data:')) return [clean]
+  const root = getHost().projectPath
+  if (!root) return [clean]
+  const rel = clean.replace(/^\/+/, '')
+  const base = root.replace(/[\\/]+$/, '')
+  // public/ first: a leading-slash url is nearly always served from there.
+  // The project root second, which is where `/src/...` lands.
+  return [`${base}/public/${rel}`, `${base}/${rel}`].flatMap((abs) => srcCandidates(abs))
+}
+
+// An <img> that works through a list of sources until one loads.
+function FallbackImg({ srcs, alt = '', onLoad }: { srcs: string[]; alt?: string; onLoad?: (d: { w: number; h: number }) => void }) {
+  const [i, setI] = useState(0)
+  useEffect(() => { setI(0) }, [srcs.join('|')])
+  if (!srcs.length || i >= srcs.length) return null
+  return (
+    <img
+      src={srcs[i]}
+      alt={alt}
+      draggable={false}
+      onLoad={(e) => onLoad?.({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
+      onError={() => setI((n) => n + 1)}
+    />
+  )
+}
+
 function LayerImageField({ layers, index, busy, applyLayers }: { layers: BgLayer[]; index: number; busy: boolean; applyLayers: (l: BgLayer[]) => void }) {
   const image = layers[index]?.image ?? ''
   const url = imageUrlOf(image)
   const name = url ? (url.split('?')[0].split(/[\\/]/).pop() || url) : ''
-  const [open, setOpen] = useState(false)
   const [dims, setDims] = useState('')
+  const srcs = assetSrcCandidates(url)
   useEffect(() => { setDims('') }, [url])
   const pick = (assetUrl: string) => {
     applyLayers(layers.map((l, i) => (i === index ? { ...l, image: `url("${assetUrl}")` } : l)))
-    setOpen(false)
   }
   return (
     <div className="embed-editor_bg-image">
       <div className="embed-editor_bg-image-row">
         <span className="embed-editor_bg-thumb">
-          {url ? <img src={url} alt="" onLoad={(e) => setDims(`${e.currentTarget.naturalWidth} × ${e.currentTarget.naturalHeight}`)} /> : null}
+          <FallbackImg srcs={srcs} onLoad={(d) => setDims(`${d.w} × ${d.h}`)} />
         </span>
         <div className="embed-editor_bg-image-meta">
           <span className="embed-editor_bg-image-name" title={url ?? ''}>{name || 'No image'}</span>
           {dims ? <span className="embed-editor_bg-image-dim">{dims}</span> : null}
         </div>
       </div>
-      <button type="button" className="u-button is-small embed-editor_bg-choose" disabled={busy} onClick={() => setOpen((o) => !o)}>
-        Choose image
+      {/* Asks the Assets panel, the same way every other "Choose…" in the app
+          does (see assetPick.js). A grid of thumbnails crammed into a 320px
+          style panel could show a handful at a time and had none of what makes
+          the real panel usable — search, folders, uploading — so picking a
+          background meant a different, worse version of a thing the app
+          already had. */}
+      <button
+        type="button"
+        className="u-button is-small embed-editor_bg-choose"
+        disabled={busy}
+        onClick={() =>
+          requestAsset({
+            mediaKind: 'image',
+            current: url ?? '',
+            onPick: (pickedRel: string) => pick(assetValueFor(pickedRel, null)),
+          })
+        }
+      >
+        {url ? 'Replace image…' : 'Choose image…'}
       </button>
-      {open ? <ImageAssetPicker selectedUrl={url ?? ''} onPick={pick} /> : null}
     </div>
   )
 }
@@ -529,7 +640,7 @@ function LayerColorField({ layers, index, busy, setProp, liveSetProp }: {
         onChange={(event) => { setDraft(event.target.value); commit(true) }}
         onFocus={() => { focused.current = true }}
         onBlur={() => { focused.current = false; commit(false) }}
-        onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }}
+        onKeyDown={(event) => { if (event.key === 'Enter') commitInPlace(event.currentTarget) }}
         disabled={busy}
         spellCheck={false}
         placeholder="rgba(0, 0, 0, 0.5)"
@@ -560,6 +671,30 @@ function LayerEditor({ layers, index, busy, setProp, clearProp, liveSetProp, app
 
   const setKind = (next: LayerKind) => {
     if (next === displayKind) return
+    // Switching between gradient kinds keeps the colours.
+    //
+    // The stops are the work — picked, positioned, adjusted — and the kind is
+    // just how they are painted. Seeding a blank layer threw them away, so
+    // trying radial to see how it looked cost the whole gradient and there was
+    // no way back to it.
+    //
+    // The geometry does NOT carry, because it does not mean the same thing:
+    // an angle is a direction for a linear gradient and nothing at all for a
+    // radial one, and a centre point is the reverse. Each kind starts on its
+    // own defaults and keeps the colours.
+    const GRADIENTS = ['linear', 'radial', 'conic']
+    if (GRADIENTS.includes(next) && GRADIENTS.includes(displayKind)) {
+      const current = parseGradient(layer.image)
+      if (current?.stops?.length) {
+        const carried = serializeGradient({
+          ...blankGradientOf(next),
+          repeating: current.repeating,
+          stops: current.stops,
+        })
+        applyLayers(layers.map((l, i) => (i === index ? { ...l, image: carried } : l)))
+        return
+      }
+    }
     const seeded = blankLayer(next)
     applyLayers(layers.map((l, i) => (i === index ? { ...l, image: seeded.image } : l)))
   }
@@ -742,11 +877,33 @@ export default function BackgroundSection(props: Props) {
         count={layers.length}
         busy={busy}
         ariaLabel="Background layers"
-        onOpen={(i) => setOpenLayer(i)}
+        onOpen={(i) => setOpenLayer((cur) => (cur === i ? null : i))}
         onReorder={reorder}
         onRemove={removeLayer}
         renderRow={(i) => ({
-          preview: <span className="embed-editor_bg-layer-preview" style={{ background: layers[i].image, backgroundSize: 'cover', backgroundPosition: 'center' }} aria-hidden="true" />,
+          preview: (() => {
+            const u = imageUrlOf(layers[i].image)
+            // A gradient is CSS this window paints as it stands.
+            if (!u) {
+              return (
+                <span
+                  className="embed-editor_bg-layer-preview"
+                  style={{ background: layers[i].image, backgroundSize: 'cover', backgroundPosition: 'center' }}
+                  aria-hidden="true"
+                />
+              )
+            }
+            // An image comes off disk, and through an <img> rather than a CSS
+            // background — the file can be reached by more than one url scheme
+            // and only an element can try the next one when the first does not
+            // load. A background that fails just paints nothing, with no way to
+            // tell that from an image that is genuinely blank.
+            return (
+              <span className="embed-editor_bg-layer-preview is-image" aria-hidden="true">
+                <FallbackImg srcs={assetSrcCandidates(u)} />
+              </span>
+            )
+          })(),
           label: layerLabel(layers[i].image),
         })}
       />
@@ -759,7 +916,7 @@ export default function BackgroundSection(props: Props) {
 
       {/* Colour — painted behind every layer. */}
       <div className="embed-editor_size-row">
-        <BgField {...props} prop="background-color" label="Color" placeholder="transparent" prefix={<ColorSwatch value={val('background-color')} busy={busy} ariaLabel="Background color" onChange={(c, live) => { if (live) props.liveSetProp('background-color', c, false); else props.setProp('background-color', c, false) }} />} />
+        <BgField {...props} prop="background-color" label="Color" placeholder="transparent" swatchLabel="Background color" />
       </div>
 
       {/* Clipping — background-clip. "None" writes border-box explicitly. */}

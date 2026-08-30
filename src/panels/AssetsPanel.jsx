@@ -6,11 +6,18 @@ import {
   ChevronRightIcon,
   FileIcon,
   CodeIcon,
+  TrashIcon,
 } from '../ui/Icons.jsx';
 
 import AssetThumb, { TEXT_EXT } from '../ui/AssetThumb.jsx';
+import MoreMenu from '../ui/MoreMenu.jsx';
+import { confirmDialog } from '../ui/ConfirmDialog.jsx';
 
 const parentOf = (rel) => (rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '');
+
+// Where a pick with no current value starts: Astro's home for images that go
+// through the build (public/ is for files served untouched).
+const PICK_HOME = 'src/assets';
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|avif|svg|ico|bmp)$/i;
 const VIDEO_EXT = /\.(mp4|webm|mov|m4v|ogv|ogg)$/i;
@@ -28,12 +35,15 @@ const pickPrompt = {
   asset: 'Choose a file',
 };
 
-// Assets panel: browses public/, uploads, drag-in/out of folders, renames.
-// External changes to public/ refresh the listing via the fs watcher.
+// Assets panel: browses the project's two asset roots — public/ (served as-is,
+// referenced by URL) and src/ (imported and optimised by the build, which is
+// where <Image> wants its images). Uploads, drag between folders and roots,
+// renames. External changes to either root refresh the listing via the fs
+// watcher.
 // `pick` is set while a field is waiting for an asset (see assetPick.js):
 // the panel filters to the kind that was asked for, starts in the folder the
 // current value lives in, and a click assigns instead of opening the file.
-export default function AssetsPanel({ project, showToast, onOpenFile, pick, onPickCancel }) {
+export default function AssetsPanel({ project, showToast, onOpenFile, pick, onPickCancel, onRecordUndo }) {
   const [entries, setEntries] = useState([]);
   const [missing, setMissing] = useState(false);
   const [cwd, setCwd] = useState('');
@@ -63,11 +73,34 @@ export default function AssetsPanel({ project, showToast, onOpenFile, pick, onPi
   // asset doesn't start over at the root. Keyed on the request itself: while
   // one is open the user is free to browse elsewhere.
   const pickKey = pick ? `${pick.mediaKind}:${pick.current || ''}` : null;
+  // Which request has already been placed. The listing arrives asynchronously,
+  // so a pick opened before it lands has to wait for it — and once placed, the
+  // refreshes that follow must not yank the user back out of wherever they
+  // browsed to.
+  const placedRef = useRef(null);
   useEffect(() => {
-    if (!pick) return;
-    setCwd(pick.current?.includes('/') ? parentOf(pick.current) : '');
+    if (!pick) {
+      placedRef.current = null;
+      return;
+    }
+    if (placedRef.current === pickKey) return;
+    if (pick.current?.includes('/')) {
+      setCwd(parentOf(pick.current));
+      placedRef.current = pickKey;
+      return;
+    }
+    // Nothing set yet: start in src/assets, where Astro wants the images it
+    // optimises. Only when something of the kind being asked for is actually
+    // in there — otherwise an empty folder is a worse start than the roots.
+    if (!entries.length) return; // listing hasn't landed; this runs again when it does
+    const inHome = (e) => e.rel === PICK_HOME || e.rel.startsWith(`${PICK_HOME}/`);
+    const hasMatch = entries.some(
+      (e) => !e.isDir && inHome(e) && kindMatches(pick.mediaKind, e.name)
+    );
+    setCwd(hasMatch ? PICK_HOME : '');
+    placedRef.current = pickKey;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pickKey]);
+  }, [pickKey, entries]);
 
   const folders = entries.filter((e) => e.isDir && e.parent === cwd);
   const files = entries
@@ -107,9 +140,19 @@ export default function AssetsPanel({ project, showToast, onOpenFile, pick, onPi
     if (!payload) return;
     if (payload.kind === 'asset') {
       if (payload.rel === destRel || parentOf(payload.rel) === destRel) return;
-      act(() =>
-        window.avb.moveAsset({ projectPath: project.path, fromRel: payload.rel, toDirRel: destRel })
-      );
+      const fromDir = parentOf(payload.rel);
+      const name = payload.rel.slice(payload.rel.lastIndexOf('/') + 1);
+      const landedRel = destRel ? `${destRel}/${name}` : name;
+      const move = (fromRel, toDirRel) =>
+        window.avb.moveAsset({ projectPath: project.path, fromRel, toDirRel });
+      act(async () => {
+        await move(payload.rel, destRel);
+        onRecordUndo?.({
+          label: `move ${name}`,
+          undo: () => move(landedRel, fromDir),
+          redo: () => move(payload.rel, destRel),
+        });
+      });
     } else {
       act(() =>
         window.avb.uploadAssets({ projectPath: project.path, destRel, filePaths: payload.paths })
@@ -131,12 +174,46 @@ export default function AssetsPanel({ project, showToast, onOpenFile, pick, onPi
     setRenaming(null);
     const clean = value.trim();
     if (!clean || clean === entry.name) return;
-    act(() => window.avb.renameAsset({ projectPath: project.path, rel: entry.rel, newName: clean }));
+    const dir = parentOf(entry.rel);
+    const toRel = dir ? `${dir}/${clean}` : clean;
+    const rename = (rel, newName) => window.avb.renameAsset({ projectPath: project.path, rel, newName });
+    act(async () => {
+      await rename(entry.rel, clean);
+      onRecordUndo?.({
+        label: `rename to ${clean}`,
+        undo: () => rename(toRel, entry.name),
+        redo: () => rename(entry.rel, clean),
+      });
+    });
+  };
+
+  // --- Delete ----------------------------------------------------------
+
+  // To the system's bin, so it can be got back — which is the only reason this
+  // is offered at all. An asset is somebody's photograph as often as it is a
+  // placeholder; the app holds no copy of it and cannot put it back itself,
+  // and the pages that point at it are files this panel never reads. So it
+  // asks first, and says where the file went.
+  const remove = (file) => {
+    act(async () => {
+      const yes = await confirmDialog({
+        title: `Delete ${file.name}?`,
+        body:
+          'The file moves to your Bin. Anything on the site still pointing at ' +
+          '/' + file.rel + ' will stop finding it.',
+        confirmLabel: 'Delete',
+        danger: true,
+      });
+      if (!yes) return;
+      const result = await window.avb.deleteAsset({ projectPath: project.path, rel: file.rel });
+      if (result?.ok === false) showToast(`${file.name} was already gone.`, 'error');
+    });
   };
 
   // --- Breadcrumb ------------------------------------------------------
 
-  const crumbs = [{ rel: '', label: 'public' }];
+  // '' is above both roots now, so it can't be called "public".
+  const crumbs = [{ rel: '', label: 'Assets' }];
   if (cwd) {
     const parts = cwd.split('/');
     parts.forEach((part, i) => {
@@ -144,7 +221,7 @@ export default function AssetsPanel({ project, showToast, onOpenFile, pick, onPi
     });
   }
 
-  if (missing) {
+  if (missing && !entries.length) {
     return (
       <div className="panel-section grow">
         <div className="panel-header">
@@ -182,12 +259,18 @@ export default function AssetsPanel({ project, showToast, onOpenFile, pick, onPi
       <div className="panel-header">
         <h2>Assets</h2>
         <div style={{ display: 'flex', gap: 2 }}>
-          <button className="ghost" title="New folder" onClick={() => setNewFolder(true)}>
+          <button
+            className="ghost"
+            title={cwd ? 'New folder' : 'Open public/ or src/ first'}
+            disabled={!cwd}
+            onClick={() => setNewFolder(true)}
+          >
             <FolderPlusIcon size={14} />
           </button>
           <button
             className="ghost"
-            title="Upload assets"
+            title={cwd ? 'Upload assets' : 'Open public/ or src/ first'}
+            disabled={!cwd}
             onClick={() =>
               act(() => window.avb.pickUploadAssets({ projectPath: project.path, destRel: cwd }))
             }
@@ -314,7 +397,7 @@ export default function AssetsPanel({ project, showToast, onOpenFile, pick, onPi
               }
               // While picking, the whole tile assigns — including for text
               // files, whose thumb would otherwise open the code editor.
-              onClick={pick ? () => pick.onPick(file.rel) : undefined}
+              onClick={pick ? () => pick.onPick(file.rel, file) : undefined}
             >
               <AssetThumb
                 file={file}
@@ -329,6 +412,24 @@ export default function AssetsPanel({ project, showToast, onOpenFile, pick, onPi
                 <div className="asset-name" onDoubleClick={() => setRenaming(file.rel)}>
                   {file.name}
                 </div>
+              )}
+              {/* Only while the pointer is on the tile, and never while
+                  picking: choosing an asset for a prop is the whole gesture
+                  then, and a menu in the corner of it is a way to lose the file
+                  instead. */}
+              {!pick && (
+                <MoreMenu
+                  className="asset-tile-menu"
+                  title={`Options for ${file.name}`}
+                  items={[
+                    {
+                      label: 'Delete',
+                      icon: <TrashIcon size={13} />,
+                      danger: true,
+                      onSelect: () => remove(file),
+                    },
+                  ]}
+                />
               )}
             </div>
             );
